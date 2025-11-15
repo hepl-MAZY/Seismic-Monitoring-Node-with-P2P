@@ -1,0 +1,18 @@
+# Ignore build output
+Debug/
+Release/
+
+# STM32CubeIDE work folders
+.settings/*
+*.launch
+
+# Compiler output
+*.o
+*.elf
+*.map
+*.bin
+*.hex
+
+# Backup files
+*.swp
+*.bak
