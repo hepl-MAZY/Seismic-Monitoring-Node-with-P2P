@@ -18,12 +18,6 @@ The node acquires acceleration data, processes it in real time, stores samples l
 - Peer-to-peer communication over Ethernet using LwIP
 - FreeRTOS task-based architecture
 
-## Project Structure
-- **Core/** — Application code, startup code, FreeRTOS tasks  
-- **Drivers/** — STM32 HAL drivers  
-- **SeismicMonitoringNodeWithP2P.ioc** — CubeMX configuration  
-- **.gitignore** — Ignore build output (Debug/, Release/)  
-- **README.md** — Project overview  
 
 ## Requirements
 - STM32 NUCLEO-F767ZI board  
@@ -37,11 +31,45 @@ The node acquires acceleration data, processes it in real time, stores samples l
 All communication uses JSON messages sent over UDP on port **12345**.  
 Nodes send a `presence` message every 10 seconds and respond to `data_request` messages with timestamped acceleration data.
 
-Example `presence`:
-```json
+Structure des messages JSON
+Message de présence (broadcast périodique)
 {
   "type": "presence",
-  "id": "node01",
-  "ip": "192.168.1.2",
-  "timestamp": "2025-11-15T10:00:00Z"
+  "id": "nucleo-01",
+  "ip": "192.168.1.101",
+  "timestamp": "2025-10-02T08:20:00Z"
+}
+
+Requête de données (point-à-point)
+{
+  "type": "data_request",
+  "from": "nucleo-02",
+  "to": "nucleo-01",
+  "timestamp": "2025-10-02T08:21:00Z"
+}
+
+Réponse avec données sismiques
+{
+  "type": "data_response",
+  "id": "nucleo-01",
+  "timestamp": "2025-10-02T08:21:01Z",
+  "acceleration": {
+  "x": 0.12,
+  "y": -0.03,
+  "z": 0.98
+},
+"status": "normal"
+}
+
+Message d’alerte (optionnel)
+{
+  "type": "alert",
+  "id": "nucleo-03",
+  "timestamp": "2025-10-02T08:22:10Z",
+  "severity": "medium",
+  "acceleration": {
+  "x": 0.45,
+  "y": 0.60,
+  "z": 1.20
+}
 }
