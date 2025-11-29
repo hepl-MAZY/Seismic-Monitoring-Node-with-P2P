@@ -23,7 +23,19 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdbool.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include "lwip/udp.h"
+#include "lwip/dns.h"
+#include "lwip/pbuf.h"
+#include "lwip/ip_addr.h"
+#include "lwip/netif.h"
+#include "lwip/inet.h"
+#include "FreeRTOS.h"
+#include "task.h"
+extern struct netif gnetif;
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -56,31 +68,50 @@ UART_HandleTypeDef huart3;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 osThreadId defaultTaskHandle;
+
 /* USER CODE BEGIN PV */
+#define BROADCAST_PORT   12345
+
+/* Global variables */
+volatile bool buttonPressed = false;
+
+/* ADC/DMA global variables */
+volatile uint8_t flagConversion=0;
+uint16_t rawADC [30];
+float rawADC_x[10], rawADC_y[10], rawADC_z[10];
+float meanADCx, meanADCy, meanADCz = 0.0f;
+float meanBufX[100], meanBufY[100], meanBufZ[100]; // To store mean vals (100 vals for 1s window)
+int meanIndex = 0;
+
+/* Network variables */
+static const char node_id[] = "nucleo-Kate";
+
+/* UART debug structure */
+typedef struct {
+  uint32_t id;
+  char     text[128];
+} Message_t;
 
 /* General Task Handling */
 osThreadId masterTaskHandle; // Push button runs/stops specified tasks
 osThreadId heartbeatTaskHandle;
-osThreadId uartDebugTaskHandle;
+osThreadId LogMessageTaskHandle;
+osMailQId logMailQId;
+
 
 /* Data Acquisition Task Handling */
 osThreadId acquisitionTaskHandle; // Store raw data AND average over 10 sample per axis
-osThreadId detectionTaskHandle; // RMS (use avg data over 1 second window) & Peak calculation (use raw data from table every 100 hz check peak >? threshold)
-osThreadId alarmTriggerTaskHandle; // Trigger LED alarm based on result from detectionTaskHandle AND remote RMS
+osThreadId DetectionTaskHandle; // Calculate RMS vals, mean vals etc.
 
 /* RTC Time Synchronization */
 osThreadId syncRTCFromNTPTaskHandle;
 osThreadId readTimeFromBQ32000TaskHandle; // store global time
 
-/* FRAM Task (Storage & Logging) */
-osThreadId storeTop10RMSvaluesTaskHandle; // timestamp, rms, peak => framrecord struct type 10 max
-osThreadId storeRemoteTopRMSValuesTaskHandle;
-
 /* Communication client/server Task Handling */
+osThreadId SyncRemoteRMSTaskHandle; // exchange remote RMS once every 60s to keep data fresh: timestamp, rms, peak => framrecord struct type 10 max
 osThreadId presenceBroadcastTaskHandle; // sends broadcast JSON msg (node alive) every 10s
 osThreadId listenDataRequestTaskHandle; // listen for incoming data_request, open UDP socket to port 12345, send data_response back to IP:port
 osThreadId sendsDataMessageTaskHandle; // sends data_request message to other discovered nodes to fetch data_response
-osThreadId syncRemoteRMSTaskHandle; // exchange remote RMS once every 60s to keep data fresh
 
 /* USER CODE END PV */
 
@@ -96,34 +127,35 @@ static void MX_I2C1_Init(void);
 static void MX_SPI2_Init(void);
 void StartDefaultTask(void const * argument);
 
+
+
 /* USER CODE BEGIN PFP */
-/* USER CODE BEGIN PFP */
+/* --- Functions --- */
+extern void log_message(const char *format, ...);
+void storeRemoteTopRMS();  // updates remote table
+void framWriteTop10ToFRAM(void);                  // writes local table to FRAM
+void framWriteRemoteRMSToFRAM(void);             // writes remote table to FRAM
+void alarmTrigger(void);
+void rmsMeanAverageCalculation(void);
 
 /* --- General tasks --- */
 void StartMasterTask(void const * argument);
 void StartHeartBeatTask(void const * argument);
-void StartUartDebugTask(void const * argument);
+void LogMessageTask(void const * argument);
 
 /* --- Acquisition / detection / alarm --- */
 void StartAcquisitionTask(void const * argument);
 void StartDetectionTask(void const * argument);
-void StartAlarmTriggerTask(void const * argument);
 
 /* --- RTC / NTP --- */
 void StartSyncRTCFromNTPTask(void const * argument);
 void StartReadTimeFromBQ32000Task(void const * argument);
 
-/* --- FRAM --- */
-void StartStoreTop10RMSvaluesTask(void const * argument);
-void StartStoreRemoteTopRMSValuesTask(void const * argument);
-
 /* --- Network --- */
+void StartSyncRemoteRMSTask(void const * argument);
 void StartPresenceBroadcastTask(void const * argument);
 void StartListenDataRequestTask(void const * argument);
 void StartSendsDataMessageTask(void const * argument);
-void StartSyncRemoteRMSTask(void const * argument);
-
-/* USER CODE END PFP */
 
 /* USER CODE END PFP */
 
@@ -169,7 +201,9 @@ int main(void)
   MX_I2C1_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
-
+  HAL_TIM_Base_Start(&htim2);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)rawADC, 30);
+  HAL_UART_Transmit(&huart3, (uint8_t*)"SYSTEM BOOT...\r\n", strlen("SYSTEM BOOT...\r\n"), HAL_MAX_DELAY);
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -199,46 +233,38 @@ int main(void)
    * osThreadId handle = osThreadCreate(osThread(name), NULL);
    * */
   /* ========================= RTOS TASKS CREATION ========================= */
-
+  osMailQDef(logMailQ, 16, Message_t);
+  logMailQId = osMailCreate(osMailQ(logMailQ), NULL);
   /* --- General tasks --- */
-  osThreadDef(masterTask, StartMasterTask, osPriorityNormal, 0, 256);
+  osThreadDef(masterTask, StartMasterTask, osPriorityHigh, 0, 256);
   masterTaskHandle = osThreadCreate(osThread(masterTask), NULL);
 
-  osThreadDef(heartbeatTask, StartHeartBeatTask, osPriorityLow, 0, 128);
+  osThreadDef(heartbeatTask, StartHeartBeatTask, osPriorityNormal, 0, 256);
   heartbeatTaskHandle = osThreadCreate(osThread(heartbeatTask), NULL);
 
-  osThreadDef(uartDebugTask, StartUartDebugTask, osPriorityBelowNormal, 0, 256);
-  uartDebugTaskHandle = osThreadCreate(osThread(uartDebugTask), NULL);
+  osThreadDef(LogMessageTask, LogMessageTask, osPriorityBelowNormal, 0, 256);
+  LogMessageTaskHandle = osThreadCreate(osThread(LogMessageTask), NULL);
 
 
   /* --- Acquisition / detection / alarm --- */
-  osThreadDef(acquisitionTask, StartAcquisitionTask, osPriorityHigh, 0, 256);
+  osThreadDef(acquisitionTask, StartAcquisitionTask, osPriorityNormal, 0, 256);
   acquisitionTaskHandle = osThreadCreate(osThread(acquisitionTask), NULL);
 
-  osThreadDef(detectionTask, StartDetectionTask, osPriorityAboveNormal, 0, 256);
-  detectionTaskHandle = osThreadCreate(osThread(detectionTask), NULL);
-
-  osThreadDef(alarmTriggerTask, StartAlarmTriggerTask, osPriorityNormal, 0, 128);
-  alarmTriggerTaskHandle = osThreadCreate(osThread(alarmTriggerTask), NULL);
+  osThreadDef(DetectionTask, StartDetectionTask, osPriorityNormal, 0, 256);
+  DetectionTaskHandle = osThreadCreate(osThread(DetectionTask), NULL);
 
 
   /* --- RTC / NTP time sync --- */
-  osThreadDef(syncRTCFromNTPTask, StartSyncRTCFromNTPTask, osPriorityBelowNormal, 0, 256);
+  osThreadDef(syncRTCFromNTPTask, StartSyncRTCFromNTPTask, osPriorityBelowNormal, 0, 128);
   syncRTCFromNTPTaskHandle = osThreadCreate(osThread(syncRTCFromNTPTask), NULL);
 
   osThreadDef(readTimeFromBQ32000Task, StartReadTimeFromBQ32000Task, osPriorityLow, 0, 128);
   readTimeFromBQ32000TaskHandle = osThreadCreate(osThread(readTimeFromBQ32000Task), NULL);
 
-
-  /* --- FRAM storage tasks --- */
-  osThreadDef(storeTop10RMSvaluesTask, StartStoreTop10RMSvaluesTask, osPriorityLow, 0, 256);
-  storeTop10RMSvaluesTaskHandle = osThreadCreate(osThread(storeTop10RMSvaluesTask), NULL);
-
-  osThreadDef(storeRemoteTopRMSValuesTask, StartStoreRemoteTopRMSValuesTask,osPriorityLow, 0, 256);
-  storeRemoteTopRMSValuesTaskHandle = osThreadCreate(osThread(storeRemoteTopRMSValuesTask), NULL);
-
-
   /* --- Network communication tasks --- */
+  osThreadDef(SyncRemoteRMSTask, StartSyncRemoteRMSTask,osPriorityBelowNormal, 0, 256);
+  SyncRemoteRMSTaskHandle = osThreadCreate(osThread(SyncRemoteRMSTask), NULL);
+
   osThreadDef(presenceBroadcastTask, StartPresenceBroadcastTask,osPriorityBelowNormal, 0, 256);
   presenceBroadcastTaskHandle = osThreadCreate(osThread(presenceBroadcastTask), NULL);
 
@@ -248,15 +274,15 @@ int main(void)
   osThreadDef(sendsDataMessageTask, StartSendsDataMessageTask, osPriorityNormal, 0, 384);
   sendsDataMessageTaskHandle = osThreadCreate(osThread(sendsDataMessageTask), NULL);
 
-  osThreadDef(syncRemoteRMSTask, StartSyncRemoteRMSTask,osPriorityLow, 0, 256);
-  syncRemoteRMSTaskHandle = osThreadCreate(osThread(syncRemoteRMSTask), NULL);
 
   /* ====================================================================== */
 
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
+  HAL_UART_Transmit(&huart3, (uint8_t*)"Giving control to scheduler\r\n", strlen("Giving control to scheduler\r\n"), HAL_MAX_DELAY);
   osKernelStart();
+
 
   /* We should never get here as control is now taken by the scheduler */
 
@@ -267,6 +293,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
   }
   /* USER CODE END 3 */
 }
@@ -638,7 +665,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, HeartbeatLED_Pin|AlarmLED_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, HeartbeatLED_Pin|AlarmLED_Pin|LD2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
@@ -649,8 +676,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : HeartbeatLED_Pin AlarmLED_Pin */
-  GPIO_InitStruct.Pin = HeartbeatLED_Pin|AlarmLED_Pin;
+  /*Configure GPIO pins : HeartbeatLED_Pin AlarmLED_Pin LD2_Pin */
+  GPIO_InitStruct.Pin = HeartbeatLED_Pin|AlarmLED_Pin|LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -669,52 +696,201 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
 
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+/* ======================= USER FUNCTION DEFINITIONS ======================= */
+
+void storeRemoteTopRMS(){
+
+}
+void framWriteTop10ToFRAM(void){
+
+}
+void framWriteRemoteRMSToFRAM(void){
+
+}
+
+void alarmTrigger(void){
+
+}
+
+void computeRMS(void){
+	// store new local top 10 rms vals
+//	float sumSqrt =0.0f;
+//	for(int i=0; i<100;i++){
+//
+//	}
+
+}
+
+void log_message(const char *format, ...)
+{
+    Message_t *msg = osMailAlloc(logMailQId, 0);
+    if (!msg) return;
+
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(msg->text, sizeof(msg->text), format, ap);
+    va_end(ap);
+
+    osMailPut(logMailQId, msg);
+}
 /* ======================= USER TASK FUNCTION DEFINITIONS ======================= */
 
 /* --- General Task Handling --- */
 void StartMasterTask(void const * argument)
 {
-    for(;;) { osDelay(1); }
+	static bool running = true;
+	static bool lastButtonState = false;
+	static bool heapSizeChecked = false;
+
+    for(;;) {
+
+    	bool currentButton = buttonPressed;
+
+
+    	if(currentButton && !lastButtonState){ // If button got toggled
+    		if(!running){
+//				//vTaskResume(acquisitionTaskHandle);
+//				vTaskResume(DetectionTaskHandle);
+				vTaskResume(heartbeatTaskHandle);
+//				vTaskResume(presenceBroadcastTaskHandle);
+//				vTaskResume(listenDataRequestTaskHandle);
+//				vTaskResume(sendsDataMessageTaskHandle);
+//				vTaskResume(syncRemoteRMSTaskHandle);
+				log_message("USER button pressed! Resuming Tasks");
+				log_message("[Tick=%lu", (unsigned long)HAL_GetTick());
+				running = true;
+			}
+    		else{
+				//vTaskSuspend(acquisitionTaskHandle);
+//				vTaskSuspend(DetectionTaskHandle);
+    			vTaskSuspend(heartbeatTaskHandle);
+//				vTaskSuspend(presenceBroadcastTaskHandle);
+//				vTaskSuspend(listenDataRequestTaskHandle);
+//				vTaskSuspend(sendsDataMessageTaskHandle);
+//				vTaskSuspend(syncRemoteRMSTaskHandle);
+				log_message("USER button pressed! Suspending Tasks");
+				log_message("Tick=%lu", (unsigned long)HAL_GetTick());
+				running = false;
+			}
+    	}
+
+    	lastButtonState = currentButton;
+    	if(!heapSizeChecked){
+        	UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(masterTaskHandle);
+        	log_message("MasterTask min free : %lu words\r\n",uxHighWaterMark);
+        	heapSizeChecked = true;
+    	}
+
+    	osDelay(1);
+    }
 }
 
 void StartHeartBeatTask(void const * argument)
 {
-    for(;;) { osDelay(1); }
+    for(;;) {
+    	HAL_GPIO_TogglePin(GPIOB, HeartbeatLED_Pin);
+    	osDelay(400);
+    }
 }
 
-void StartUartDebugTask(void const * argument)
+void LogMessageTask(void const * argument)
 {
-    for(;;) { osDelay(1); }
+	static bool heapSizeChecked = false;
+    for (;;)
+    {
+        osEvent evt = osMailGet(logMailQId, osWaitForever);
+        if (evt.status == osEventMail)
+        {
+            Message_t *m = evt.value.p;
+            HAL_UART_Transmit(&huart3, (uint8_t*)m->text, strlen(m->text), HAL_MAX_DELAY);
+            HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", strlen("\r\n"), HAL_MAX_DELAY);
+            osMailFree(logMailQId, m);
+        }
+        if(!heapSizeChecked){
+			UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(LogMessageTaskHandle);
+			log_message("LogMessageTask min free : %lu words\r\n",uxHighWaterMark);
+			heapSizeChecked = true;
+		}
+        osDelay(1);
+    }
 }
+
 
 
 /* --- Data Acquisition Task Handling --- */
 void StartAcquisitionTask(void const * argument)
 {
-    for(;;) { osDelay(1); }
+	static bool heapSizeChecked = false;
+
+    for(;;) {
+    	float sumADC_x = 0.0f, sumADC_y = 0.0f, sumADC_z = 0.0f;
+		if(flagConversion){ // Every 100 Hz triggered by TIM2 (10 raw vals on each axe)
+			for(int i=0;i<30;i++){
+				float adc =  ((float)rawADC[i] * 3.3f)/ 4095.0f;
+				if(i%3 == 0){
+					rawADC_x[i/3]=adc;
+					sumADC_x+=adc;
+				}
+				else if(i%3 == 1){
+					rawADC_y[i/3]=adc;
+					sumADC_y+=adc;
+				}
+				else if(i%3 == 2){
+					rawADC_z[i/3]=adc;
+					sumADC_z+=adc;
+				}
+			}
+			flagConversion=0;
+			meanADCx = sumADC_x / 10.0f;
+			meanADCy = sumADC_y / 10.0f;
+			meanADCz = sumADC_z / 10.0f;
+			meanBufX[meanIndex] = meanADCx;
+			meanBufY[meanIndex] = meanADCy;
+			meanBufZ[meanIndex] = meanADCz;
+			meanIndex++;
+			if(meanIndex==100){
+				meanIndex=0; // Reset after storing 100 mean vals
+				//computeRMS
+			}
+//			log_message("Data aquired => Mean over 10 raw values\r\n");
+//			log_message("MeanXpos=%.3f V \t MeanYpos=%.3f V \t MeanZpos=%.3f V \r\n",meanADCx, meanADCy, meanADCz);
+			if(!heapSizeChecked){
+				UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(acquisitionTaskHandle);
+				log_message("AcquisitionTask min free : %lu words\r\n",uxHighWaterMark);
+				heapSizeChecked = true;
+			}
+		}
+		osDelay(1);
+    }
 }
 
-void StartDetectionTask(void const * argument)
-{
-    for(;;) { osDelay(1); }
-}
+void StartDetectionTask(void const * argument){
+	for(;;){
+		// compute RMS, mean , peak, avg etc.
+//		computeRMS();
+//		alarmTrigger();
 
-void StartAlarmTriggerTask(void const * argument)
-{
-    for(;;) { osDelay(1); }
+		osDelay(1);
+	}
 }
 
 
 /* --- RTC Time Synchronization --- */
 void StartSyncRTCFromNTPTask(void const * argument)
 {
-    for(;;) { osDelay(1); }
+    for(;;) {
+    	osDelay(1);
+    }
 }
 
 void StartReadTimeFromBQ32000Task(void const * argument)
@@ -723,27 +899,27 @@ void StartReadTimeFromBQ32000Task(void const * argument)
 }
 
 
-/* --- FRAM Task (Storage & Logging) --- */
-void StartStoreTop10RMSvaluesTask(void const * argument)
-{
-    for(;;) { osDelay(1); }
-}
-
-void StartStoreRemoteTopRMSValuesTask(void const * argument)
-{
-    for(;;) { osDelay(1); }
-}
-
-
 /* --- Communication Client/Server Task Handling --- */
+void StartSyncRemoteRMSTask(void const * argument)
+{
+    for(;;) {
+//    	framWriteTop10ToFRAM();
+//    	framWriteRemoteRMSToFRAM();
+
+    	osDelay(1); }
+}
+
 void StartPresenceBroadcastTask(void const * argument)
 {
-    for(;;) { osDelay(1); }
+	for(;;) { osDelay(1); }
 }
 
 void StartListenDataRequestTask(void const * argument)
 {
-    for(;;) { osDelay(1); }
+    for(;;) {
+//    	storeRemoteTopRMS();
+
+    	osDelay(1); }
 }
 
 void StartSendsDataMessageTask(void const * argument)
@@ -751,13 +927,17 @@ void StartSendsDataMessageTask(void const * argument)
     for(;;) { osDelay(1); }
 }
 
-void StartSyncRemoteRMSTask(void const * argument)
-{
-    for(;;) { osDelay(1); }
-}
 
 /* ============================================================================== */
 
+/* ======================= USER CALLBACK FUNCTION DEFINITIONS ======================= */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
+	if(GPIO_Pin == USER_Btn_Pin)buttonPressed = !buttonPressed;
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
+	flagConversion = 1;
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -772,6 +952,9 @@ void StartDefaultTask(void const * argument)
   /* init code for LWIP */
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
+   HAL_UART_Transmit(&huart3, (uint8_t*)"MX_LWIP_Init Initialized...\r\n",
+                     strlen("MX_LWIP_Init Initialized...\r\n"), HAL_MAX_DELAY);
+
   /* Infinite loop */
   for(;;)
   {
@@ -782,7 +965,7 @@ void StartDefaultTask(void const * argument)
 
 /**
   * @brief  Period elapsed callback in non blocking mode
-  * @note   This function is called  when TIM7 interrupt took place, inside
+  * @note   This function is called  when TIM1 interrupt took place, inside
   * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
   * a global variable "uwTick" used as application time base.
   * @param  htim : TIM handle
@@ -793,7 +976,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   /* USER CODE BEGIN Callback 0 */
 
   /* USER CODE END Callback 0 */
-  if (htim->Instance == TIM7)
+  if (htim->Instance == TIM1)
   {
     HAL_IncTick();
   }
