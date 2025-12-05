@@ -34,6 +34,7 @@
 #include "lwip/netif.h"
 #include "lwip/inet.h"
 #include "FreeRTOS.h"
+#include <math.h>
 #include "task.h"
 extern struct netif gnetif;
 /* USER CODE END Includes */
@@ -68,9 +69,12 @@ UART_HandleTypeDef huart3;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 osThreadId defaultTaskHandle;
-
 /* USER CODE BEGIN PV */
 #define BROADCAST_PORT   12345
+#define MAX_MSG_LEN 128
+#define NTP_SERVER "pool.ntp.org"
+#define NTP_PORT 123
+#define NTP_TIMESTAMP_DELTA 2208988800UL
 
 /* Global variables */
 volatile bool buttonPressed = false;
@@ -80,6 +84,7 @@ volatile uint8_t flagConversion=0;
 uint16_t rawADC [30];
 float rawADC_x[10], rawADC_y[10], rawADC_z[10];
 float meanADCx, meanADCy, meanADCz = 0.0f;
+float topLocalRMS [10][3] = {0.0};
 float meanBufX[100], meanBufY[100], meanBufZ[100]; // To store mean vals (100 vals for 1s window)
 int meanIndex = 0;
 
@@ -126,8 +131,6 @@ static void MX_TIM2_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI2_Init(void);
 void StartDefaultTask(void const * argument);
-
-
 
 /* USER CODE BEGIN PFP */
 /* --- Functions --- */
@@ -236,13 +239,13 @@ int main(void)
   osMailQDef(logMailQ, 16, Message_t);
   logMailQId = osMailCreate(osMailQ(logMailQ), NULL);
   /* --- General tasks --- */
-  osThreadDef(masterTask, StartMasterTask, osPriorityHigh, 0, 256);
+  osThreadDef(masterTask, StartMasterTask, osPriorityNormal, 0, 256);
   masterTaskHandle = osThreadCreate(osThread(masterTask), NULL);
 
-  osThreadDef(heartbeatTask, StartHeartBeatTask, osPriorityNormal, 0, 256);
+  osThreadDef(heartbeatTask, StartHeartBeatTask, osPriorityBelowNormal, 0, 256);
   heartbeatTaskHandle = osThreadCreate(osThread(heartbeatTask), NULL);
 
-  osThreadDef(LogMessageTask, LogMessageTask, osPriorityBelowNormal, 0, 256);
+  osThreadDef(LogMessageTask, LogMessageTask, osPriorityNormal, 0, 256);
   LogMessageTaskHandle = osThreadCreate(osThread(LogMessageTask), NULL);
 
 
@@ -268,21 +271,26 @@ int main(void)
   osThreadDef(presenceBroadcastTask, StartPresenceBroadcastTask,osPriorityBelowNormal, 0, 256);
   presenceBroadcastTaskHandle = osThreadCreate(osThread(presenceBroadcastTask), NULL);
 
-  osThreadDef(listenDataRequestTask, StartListenDataRequestTask,osPriorityAboveNormal, 0, 384);
+  osThreadDef(listenDataRequestTask, StartListenDataRequestTask,osPriorityAboveNormal, 0, 256);
   listenDataRequestTaskHandle = osThreadCreate(osThread(listenDataRequestTask), NULL);
 
-  osThreadDef(sendsDataMessageTask, StartSendsDataMessageTask, osPriorityNormal, 0, 384);
+  osThreadDef(sendsDataMessageTask, StartSendsDataMessageTask, osPriorityNormal, 0, 256);
   sendsDataMessageTaskHandle = osThreadCreate(osThread(sendsDataMessageTask), NULL);
 
 
   /* ====================================================================== */
+  extern size_t xPortGetFreeHeapSize(void);
+  extern size_t xPortGetMinimumEverFreeHeapSize(void);
+
+  char buf[64];
+  snprintf(buf, sizeof(buf), "Free heap before scheduler: %u bytes\r\n",
+           (unsigned)xPortGetFreeHeapSize());
+  HAL_UART_Transmit(&huart3, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
 
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
-  HAL_UART_Transmit(&huart3, (uint8_t*)"Giving control to scheduler\r\n", strlen("Giving control to scheduler\r\n"), HAL_MAX_DELAY);
   osKernelStart();
-
 
   /* We should never get here as control is now taken by the scheduler */
 
@@ -719,16 +727,47 @@ void framWriteRemoteRMSToFRAM(void){
 }
 
 void alarmTrigger(void){
-
+	HAL_GPIO_TogglePin(GPIOB, AlarmLED_Pin);
+	osDelay(400);
 }
 
 void computeRMS(void){
-	// store new local top 10 rms vals
-//	float sumSqrt =0.0f;
-//	for(int i=0; i<100;i++){
-//
-//	}
+	// store new local top 10 rms vals to topLocalRMS data taken from meanBufX[100], meanBufY[100], meanBufZ[100];
+	float sumX, sumY, sumZ = 0.0f;
+	float sqrtX, sqrtY, sqrtZ = 0.0f;
+	for(int i=0; i<100;i++){
+		sumX += meanBufX[i] * meanBufX[i];
+		sumY += meanBufY[i] * meanBufY[i];
+		sumZ += meanBufZ[i] * meanBufZ[i];
+	}
+	sqrtX = sqrtf(sumX / 100.0f);
+	sqrtY = sqrtf(sumY / 100.0f);
+	sqrtZ = sqrtf(sumZ / 100.0f);
+	log_message("RMS computed over 1s window: X=%.4f  Y=%.4f  Z=%.4f", sqrtX, sqrtY, sqrtZ);
+	float sqrtXYZ [3] = {sqrtX,sqrtY,sqrtZ};
 
+	// Check if new value is higher than stored values (assuming initially stored all 0.0)
+	for (int j = 0; j < 3; j++) {
+		int minIndex = 0;
+		for (int i = 1; i < 10; i++) {
+			if (topLocalRMS[i][j] < topLocalRMS[minIndex][j]) {
+				minIndex = i;
+			}
+		}
+		if (sqrtXYZ[j] > topLocalRMS[minIndex][j]) {
+			topLocalRMS[minIndex][j] = sqrtXYZ[j];
+		}
+	}
+	log_message("======= TOP 10 LOCAL RMS VALUES =======");
+	for (int i = 0; i < 10; i++)
+	{
+		log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
+					i,
+					topLocalRMS[i][0],
+					topLocalRMS[i][1],
+					topLocalRMS[i][2]);
+	}
+	log_message("========================================");
 }
 
 void log_message(const char *format, ...)
@@ -759,8 +798,8 @@ void StartMasterTask(void const * argument)
 
     	if(currentButton && !lastButtonState){ // If button got toggled
     		if(!running){
-//				//vTaskResume(acquisitionTaskHandle);
-//				vTaskResume(DetectionTaskHandle);
+				vTaskResume(acquisitionTaskHandle);
+				vTaskResume(DetectionTaskHandle);
 				vTaskResume(heartbeatTaskHandle);
 //				vTaskResume(presenceBroadcastTaskHandle);
 //				vTaskResume(listenDataRequestTaskHandle);
@@ -771,8 +810,8 @@ void StartMasterTask(void const * argument)
 				running = true;
 			}
     		else{
-				//vTaskSuspend(acquisitionTaskHandle);
-//				vTaskSuspend(DetectionTaskHandle);
+				vTaskSuspend(acquisitionTaskHandle);
+				vTaskSuspend(DetectionTaskHandle);
     			vTaskSuspend(heartbeatTaskHandle);
 //				vTaskSuspend(presenceBroadcastTaskHandle);
 //				vTaskSuspend(listenDataRequestTaskHandle);
@@ -860,10 +899,11 @@ void StartAcquisitionTask(void const * argument)
 			meanIndex++;
 			if(meanIndex==100){
 				meanIndex=0; // Reset after storing 100 mean vals
-				//computeRMS
+				log_message("100 mean data samples acquired => computing RMS (1s window)\r\n");
+//				log_message("Last data: MeanXpos=%.3f V \t MeanYpos=%.3f V \t MeanZpos=%.3f V \r\n",meanADCx, meanADCy, meanADCz);
+				computeRMS();
 			}
-//			log_message("Data aquired => Mean over 10 raw values\r\n");
-//			log_message("MeanXpos=%.3f V \t MeanYpos=%.3f V \t MeanZpos=%.3f V \r\n",meanADCx, meanADCy, meanADCz);
+
 			if(!heapSizeChecked){
 				UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(acquisitionTaskHandle);
 				log_message("AcquisitionTask min free : %lu words\r\n",uxHighWaterMark);
@@ -876,8 +916,7 @@ void StartAcquisitionTask(void const * argument)
 
 void StartDetectionTask(void const * argument){
 	for(;;){
-		// compute RMS, mean , peak, avg etc.
-//		computeRMS();
+		// Check computed RMS
 //		alarmTrigger();
 
 		osDelay(1);
@@ -909,10 +948,49 @@ void StartSyncRemoteRMSTask(void const * argument)
     	osDelay(1); }
 }
 
-void StartPresenceBroadcastTask(void const * argument)
+void StartPresenceBroadcastTask(void const *argument)
 {
-	for(;;) { osDelay(1); }
+    struct udp_pcb *pcb;
+    ip_addr_t dest_ip;
+    err_t err;
+
+    while (!netif_is_up(&gnetif)) {
+        osDelay(100);
+    }
+
+    pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+    if (!pcb) {
+        log_message("udp_new failed");
+        vTaskDelete(NULL);
+    }
+
+    err = udp_bind(pcb, IP_ADDR_ANY, 0);
+    if (err != ERR_OK) {
+        log_message("udp_bind failed: %d", err);
+        udp_remove(pcb);
+        vTaskDelete(NULL);
+    }
+
+    IP4_ADDR(ip_2_ip4(&dest_ip), 192,168,1,255);
+    log_message("UDP presence socket ready");
+
+    for(;;) {
+        char msg[64];
+        int len = snprintf(msg, sizeof(msg), "Hello from %s", node_id);
+
+        struct pbuf *pb = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
+        memcpy(pb->payload, msg, len);
+
+        err = udp_sendto(pcb, pb, &dest_ip, BROADCAST_PORT);
+        pbuf_free(pb);
+
+        log_message("Presence message sent (err=%d)", err);
+        osDelay(10000); // Every 10s
+    }
 }
+
+
+
 
 void StartListenDataRequestTask(void const * argument)
 {
@@ -952,14 +1030,44 @@ void StartDefaultTask(void const * argument)
   /* init code for LWIP */
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
-   HAL_UART_Transmit(&huart3, (uint8_t*)"MX_LWIP_Init Initialized...\r\n",
-                     strlen("MX_LWIP_Init Initialized...\r\n"), HAL_MAX_DELAY);
 
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
+
+  /* Wait until the interface is up */
+  while (!netif_is_up(&gnetif)) {
+      osDelay(100);
   }
+
+  /* Print IP configuration */
+  char ip_buf[16];
+  char mask_buf[16];
+  char gw_buf[16];
+
+  /* Convert values */
+  ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip_buf, sizeof(ip_buf));
+  ip4addr_ntoa_r(netif_ip4_netmask(&gnetif), mask_buf, sizeof(mask_buf));
+  ip4addr_ntoa_r(netif_ip4_gw(&gnetif), gw_buf, sizeof(gw_buf));
+
+  /* Print using your logger or printf */
+  log_message("IP     : %s", ip_buf);
+  log_message("MASK   : %s", mask_buf);
+  log_message("GW     : %s", gw_buf);
+
+  /* Print MAC address */
+  log_message("MAC    : %02X:%02X:%02X:%02X:%02X:%02X",
+      gnetif.hwaddr[0], gnetif.hwaddr[1], gnetif.hwaddr[2],
+      gnetif.hwaddr[3], gnetif.hwaddr[4], gnetif.hwaddr[5]);
+
+
+  char buf2[64];
+  snprintf(buf2, sizeof(buf2), "Free heap after MX_LWIP_Init: %u bytes",
+           (unsigned)xPortGetFreeHeapSize());
+  log_message("%s", buf2);
+
+  /* Main loop */
+  for(;;) {
+      osDelay(1);
+  }
+
   /* USER CODE END 5 */
 }
 
