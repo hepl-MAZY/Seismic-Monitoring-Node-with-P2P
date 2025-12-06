@@ -164,6 +164,59 @@ void StartSendsDataMessageTask(void const * argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void udp_receive_callback(void *arg, struct udp_pcb *pcb,struct pbuf *p, const ip_addr_t *addr, u16_t port)
+{
+	char jsonPayload[256];
+	if (!p) return;
+
+	u16_t len = p->tot_len;
+	if (len >= sizeof(jsonPayload)) {
+	    len = sizeof(jsonPayload) - 1;
+	}
+	pbuf_copy_partial(p, jsonPayload, len, 0);
+	jsonPayload[len] = '\0';
+
+    log_message("======> Received payload : %s\r\n", jsonPayload);
+
+	// Check whether beginning payload corresponds to type data_request
+	if (strstr(jsonPayload, "data_request")) {
+		char response[200];
+		char timestamp[32];
+		char type[]="data_response";
+		char status[]="inconclusive";
+		float topRecentRMSx = 0.0f;
+		float topRecentRMSy = 0.0f;
+		float topRecentRMSz = 0.0f;
+		snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
+
+		int resp_len = snprintf(response, sizeof(response),
+		                                "{"
+		                                  "\"type\":\"%s\","
+		                                  "\"id\":\"%s\","
+		                                  "\"timestamp\":\"%s\","
+		                                  "\"acceleration\":{"
+		                                     "\"x\":%.4f,"
+		                                     "\"y\":%.4f,"
+		                                     "\"z\":%.4f"
+		                                  "},"
+		                                  "\"Status\":\"%s\""
+		                                "}",
+		                                type, node_id, timestamp,
+		                                topRecentRMSx, topRecentRMSy, topRecentRMSz,
+		                                status);
+
+		struct pbuf *resp = pbuf_alloc(PBUF_TRANSPORT, resp_len, PBUF_RAM);
+		memcpy(resp->payload, response, resp_len);
+		err_t err = udp_sendto(pcb, resp, addr, port);
+		log_message("Response message sent (err=%d)\r\n", err);
+
+		pbuf_free(resp);
+	}
+	else{
+		log_message("JSON payload type incorrect\r\n");
+	}
+	pbuf_free(p);
+}
 
 /* USER CODE END 0 */
 
@@ -236,13 +289,15 @@ int main(void)
    * osThreadId handle = osThreadCreate(osThread(name), NULL);
    * */
   /* ========================= RTOS TASKS CREATION ========================= */
+
+  /* Stack size for each task is sized depending on Highwatermark value to leave at least 30% free memory on the stack size */
   osMailQDef(logMailQ, 16, Message_t);
   logMailQId = osMailCreate(osMailQ(logMailQ), NULL);
   /* --- General tasks --- */
   osThreadDef(masterTask, StartMasterTask, osPriorityNormal, 0, 256);
   masterTaskHandle = osThreadCreate(osThread(masterTask), NULL);
 
-  osThreadDef(heartbeatTask, StartHeartBeatTask, osPriorityBelowNormal, 0, 256);
+  osThreadDef(heartbeatTask, StartHeartBeatTask, osPriorityBelowNormal, 0, 128);
   heartbeatTaskHandle = osThreadCreate(osThread(heartbeatTask), NULL);
 
   osThreadDef(LogMessageTask, LogMessageTask, osPriorityNormal, 0, 256);
@@ -253,7 +308,7 @@ int main(void)
   osThreadDef(acquisitionTask, StartAcquisitionTask, osPriorityNormal, 0, 256);
   acquisitionTaskHandle = osThreadCreate(osThread(acquisitionTask), NULL);
 
-  osThreadDef(DetectionTask, StartDetectionTask, osPriorityNormal, 0, 256);
+  osThreadDef(DetectionTask, StartDetectionTask, osPriorityNormal, 0, 128);
   DetectionTaskHandle = osThreadCreate(osThread(DetectionTask), NULL);
 
 
@@ -836,8 +891,15 @@ void StartMasterTask(void const * argument)
 
 void StartHeartBeatTask(void const * argument)
 {
+	static bool heapSizeChecked = false;
+
     for(;;) {
     	HAL_GPIO_TogglePin(GPIOB, HeartbeatLED_Pin);
+    	if(!heapSizeChecked){
+			UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(heartbeatTaskHandle);
+			log_message("HeartBeatTask min free : %lu words\r\n",uxHighWaterMark);
+			heapSizeChecked = true;
+		}
     	osDelay(400);
     }
 }
@@ -950,9 +1012,10 @@ void StartSyncRemoteRMSTask(void const * argument)
 
 void StartPresenceBroadcastTask(void const *argument)
 {
-    struct udp_pcb *pcb;
-    ip_addr_t dest_ip;
-    err_t err;
+	static bool heapSizeChecked = false;
+    static struct udp_pcb *pcb;
+    static ip_addr_t dest_ip;
+    static err_t err;
 
     while (!netif_is_up(&gnetif)) {
         osDelay(100);
@@ -975,8 +1038,24 @@ void StartPresenceBroadcastTask(void const *argument)
     log_message("UDP presence socket ready");
 
     for(;;) {
-        char msg[64];
-        int len = snprintf(msg, sizeof(msg), "Hello from %s", node_id);
+    	char msg[128];
+		char ip_str[16];
+		char timestamp[32];
+//      int len = snprintf(msg, sizeof(msg), "Hello from %s", node_id);
+
+		ipaddr_ntoa_r(netif_ip4_addr(netif_default), ip_str, sizeof(ip_str));
+		snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
+
+        int len = snprintf(msg, sizeof(msg),
+                           "{"
+                             "\"type\":\"presence\","
+                             "\"id\":\"%s\","
+                             "\"ip\":\"%s\","
+                             "\"timestamp\":\"%s\""
+                           "}",
+                           node_id,
+						   ip_str,
+						   timestamp);
 
         struct pbuf *pb = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
         memcpy(pb->payload, msg, len);
@@ -985,6 +1064,11 @@ void StartPresenceBroadcastTask(void const *argument)
         pbuf_free(pb);
 
         log_message("Presence message sent (err=%d)", err);
+        if(!heapSizeChecked){
+			UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(acquisitionTaskHandle);
+			log_message("PresenceBroadcastTask min free : %lu words\r\n",uxHighWaterMark);
+			heapSizeChecked = true;
+		}
         osDelay(10000); // Every 10s
     }
 }
@@ -992,12 +1076,35 @@ void StartPresenceBroadcastTask(void const *argument)
 
 
 
-void StartListenDataRequestTask(void const * argument)
+void StartListenDataRequestTask(void const * argument) // Server Listening incoming data request
 {
-    for(;;) {
-//    	storeRemoteTopRMS();
+	static struct udp_pcb *server_pcb;
+	static err_t err;
 
-    	osDelay(1); }
+	while (!netif_is_up(&gnetif)) {
+		osDelay(100);
+	}
+
+	server_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+	if (!server_pcb) {
+		log_message("udp_new failed");
+		vTaskDelete(NULL);
+	}
+
+	err = udp_bind(server_pcb, IP_ADDR_ANY, 12345); // Server listen on port 12345
+	if (err != ERR_OK) {
+		log_message("udp_bind failed: %d", err);
+		udp_remove(server_pcb);
+		vTaskDelete(NULL);
+	}
+
+	udp_recv(server_pcb, udp_receive_callback, NULL); // Callback send localData to request node
+
+	log_message("UDP server listening on port 12345");
+
+    for(;;) {
+    	osDelay(1);
+    }
 }
 
 void StartSendsDataMessageTask(void const * argument)
