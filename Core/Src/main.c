@@ -36,6 +36,8 @@
 #include "FreeRTOS.h"
 #include <math.h>
 #include "task.h"
+#define JSMN_PARENT_LINKS
+#include "jsmn.h"
 extern struct netif gnetif;
 /* USER CODE END Includes */
 
@@ -75,6 +77,7 @@ osThreadId defaultTaskHandle;
 #define NTP_SERVER "pool.ntp.org"
 #define NTP_PORT 123
 #define NTP_TIMESTAMP_DELTA 2208988800UL
+#define MAX_NODES 10
 
 /* Global variables */
 volatile bool buttonPressed = false;
@@ -88,13 +91,21 @@ float topLocalRMS [10][3] = {0.0};
 float meanBufX[100], meanBufY[100], meanBufZ[100]; // To store mean vals (100 vals for 1s window)
 int meanIndex = 0;
 
+
 /* Network variables */
+typedef struct {
+    char id[20];
+    ip_addr_t ip;
+} NodeInfo;
+
 static const char node_id[] = "nucleo-Kate";
+static NodeInfo nodes[MAX_NODES];
+static size_t node_count = 0;
 
 /* UART debug structure */
 typedef struct {
   uint32_t id;
-  char     text[128];
+  char text[MAX_MSG_LEN];
 } Message_t;
 
 /* General Task Handling */
@@ -115,8 +126,8 @@ osThreadId readTimeFromBQ32000TaskHandle; // store global time
 /* Communication client/server Task Handling */
 osThreadId SyncRemoteRMSTaskHandle; // exchange remote RMS once every 60s to keep data fresh: timestamp, rms, peak => framrecord struct type 10 max
 osThreadId presenceBroadcastTaskHandle; // sends broadcast JSON msg (node alive) every 10s
-osThreadId listenDataRequestTaskHandle; // listen for incoming data_request, open UDP socket to port 12345, send data_response back to IP:port
-osThreadId sendsDataMessageTaskHandle; // sends data_request message to other discovered nodes to fetch data_response
+osThreadId listenNetworkTaskHandle; // listen for incoming data_request, open UDP socket to port 12345, send data_response back to IP:port
+osThreadId sendDataRequestTaskHandle; // sends data_request message to other discovered nodes to fetch data_response
 
 /* USER CODE END PV */
 
@@ -135,12 +146,14 @@ void StartDefaultTask(void const * argument);
 /* USER CODE BEGIN PFP */
 /* --- Functions --- */
 extern void log_message(const char *format, ...);
-void storeRemoteTopRMS();  // updates remote table
+void storeLocalTopRMS(float rms_x, float rms_y,float rms_z);
 void framWriteTop10ToFRAM(void);                  // writes local table to FRAM
 void framWriteRemoteRMSToFRAM(void);             // writes remote table to FRAM
 void alarmTrigger(void);
-void rmsMeanAverageCalculation(void);
-
+void handle_presence(const char *json);
+void handle_data_request(struct udp_pcb *pcb, const ip_addr_t *addr, u16_t port);
+void handle_data_response(const char *json);
+void handle_alert(const char *json);
 /* --- General tasks --- */
 void StartMasterTask(void const * argument);
 void StartHeartBeatTask(void const * argument);
@@ -157,13 +170,21 @@ void StartReadTimeFromBQ32000Task(void const * argument);
 /* --- Network --- */
 void StartSyncRemoteRMSTask(void const * argument);
 void StartPresenceBroadcastTask(void const * argument);
-void StartListenDataRequestTask(void const * argument);
-void StartSendsDataMessageTask(void const * argument);
+void StartListenNetworkTaskHandle(void const * argument);
+void StartSendDataRequestTaskHandle(void const * argument);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
+  if (tok->type == JSMN_STRING && (int)strlen(s) == tok->end - tok->start &&
+      strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
+    return 0;
+  }
+  return -1;
+}
+
 void udp_receive_callback(void *arg, struct udp_pcb *pcb,struct pbuf *p, const ip_addr_t *addr, u16_t port)
 {
 	char jsonPayload[256];
@@ -176,48 +197,163 @@ void udp_receive_callback(void *arg, struct udp_pcb *pcb,struct pbuf *p, const i
 	pbuf_copy_partial(p, jsonPayload, len, 0);
 	jsonPayload[len] = '\0';
 
-    log_message("======> Received payload : %s\r\n", jsonPayload);
+    log_message("\n\n======> Received payload <======\r\n: %s\r\n", jsonPayload);
 
-	// Check whether beginning payload corresponds to type data_request
+	// Check json type payload
 	if (strstr(jsonPayload, "data_request")) {
-		char response[200];
-		char timestamp[32];
-		char type[]="data_response";
-		char status[]="inconclusive";
-		float topRecentRMSx = 0.0f;
-		float topRecentRMSy = 0.0f;
-		float topRecentRMSz = 0.0f;
-		snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
-
-		int resp_len = snprintf(response, sizeof(response),
-		                                "{"
-		                                  "\"type\":\"%s\","
-		                                  "\"id\":\"%s\","
-		                                  "\"timestamp\":\"%s\","
-		                                  "\"acceleration\":{"
-		                                     "\"x\":%.4f,"
-		                                     "\"y\":%.4f,"
-		                                     "\"z\":%.4f"
-		                                  "},"
-		                                  "\"Status\":\"%s\""
-		                                "}",
-		                                type, node_id, timestamp,
-		                                topRecentRMSx, topRecentRMSy, topRecentRMSz,
-		                                status);
-
-		struct pbuf *resp = pbuf_alloc(PBUF_TRANSPORT, resp_len, PBUF_RAM);
-		memcpy(resp->payload, response, resp_len);
-		err_t err = udp_sendto(pcb, resp, addr, port);
-		log_message("Response message sent (err=%d)\r\n", err);
-
-		pbuf_free(resp);
+		handle_data_request(pcb, addr, port); // Send local data to requested node
+	}
+	else if (strstr(jsonPayload, "data_response")) {
+		handle_data_response(jsonPayload); // Collect data response and store locally + detection task
+	}
+	else if (strstr(jsonPayload, "presence")) {
+		handle_presence(jsonPayload); // Collect known nodes ID for data_request, allows alarm to be triggered IF AND ONLY IF all KNOWN nodes sent alert msg too
+	}
+	else if (strstr(jsonPayload, "alert")) {
+		handle_alert(jsonPayload); // Listen for alerts
 	}
 	else{
-		log_message("JSON payload type incorrect\r\n");
+		log_message("JSON payload invalid type\r\n");
 	}
 	pbuf_free(p);
 }
 
+void handle_presence(const char *json){
+	char id_buf[20];
+	char ip_buf[32];
+	jsmn_parser p;
+	jsmntok_t t[16];
+
+	jsmn_init(&p);
+	int r = jsmn_parse(&p, json, strlen(json), t, 16);
+	if (r < 0) return;
+
+	for (int i = 1; i < r; i++) {
+		if (jsoneq(json, &t[i], "id") == 0) {
+			int len = t[i+1].end - t[i+1].start;
+			memcpy(id_buf, json + t[i+1].start, len);
+			id_buf[len] = '\0';
+			i++;
+		}
+		if (jsoneq(json, &t[i], "ip") == 0) {
+			int len = t[i+1].end - t[i+1].start;
+			memcpy(ip_buf, json + t[i+1].start, len);
+			ip_buf[len] = '\0';
+			i++;
+		}
+	}
+
+	bool id_exist = false;
+	for(int i=0;i<MAX_NODES;i++){
+		if((strcmp(nodes[i].id, id_buf) == 0)){
+			id_exist = true;
+			break;
+		}
+	}
+
+	if(!id_exist && (node_count < MAX_NODES)){
+		NodeInfo new_node;
+
+		ipaddr_aton(ip_buf, &new_node.ip); // Convert str to ipaddress
+		strncpy(new_node.id, id_buf, sizeof(new_node.id));
+
+		nodes[node_count]=new_node;
+		node_count++;
+		log_message("New presence received, storing IP & ID in local memory : \r\nIP= %s\r\nID= %s",ip_buf, id_buf);
+	}
+	else{
+		log_message("Old presence received, already stored in local memory : \r\nIP= %s\r\nID= %s",ip_buf, id_buf);
+	}
+
+}
+
+void handle_data_request(struct udp_pcb *pcb, const ip_addr_t *addr, u16_t port){
+	char response[200];
+	char timestamp[32];
+	char type[]="data_response";
+	char status[]="inconclusive";
+	float topRecentRMSx = 0.0f;
+	float topRecentRMSy = 0.0f;
+	float topRecentRMSz = 0.0f;
+	snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
+
+	int resp_len = snprintf(response, sizeof(response),
+									"{"
+									  "\"type\":\"%s\","
+									  "\"id\":\"%s\","
+									  "\"timestamp\":\"%s\","
+									  "\"acceleration\":{"
+										 "\"x\":%.4f,"
+										 "\"y\":%.4f,"
+										 "\"z\":%.4f"
+									  "},"
+									  "\"Status\":\"%s\""
+									"}",
+									type, node_id, timestamp,
+									topRecentRMSx, topRecentRMSy, topRecentRMSz,
+									status);
+
+	struct pbuf *resp = pbuf_alloc(PBUF_TRANSPORT, resp_len, PBUF_RAM);
+	memcpy(resp->payload, response, resp_len);
+	err_t err = udp_sendto(pcb, resp, addr, port);
+	log_message("Response message sent (err=%d)\r\n", err);
+
+	pbuf_free(resp);
+}
+
+void handle_data_response(const char *json){
+	// Extract remote RMS vals and store in local if in top 10
+	float rms_x = 0.0f;
+	float rms_y = 0.0f;
+	float rms_z = 0.0f;
+	jsmn_parser p;
+	jsmntok_t t[16];
+
+	jsmn_init(&p);
+	int r = jsmn_parse(&p, json, strlen(json), t, 16); // json item count
+	if (r < 0) return;
+
+	for (int i = 1; i < r; i++) {
+		if (jsoneq(json, &t[i], "acceleration") == 0) {
+			int selected_obj = i + 1;
+			int j = selected_obj + 1;
+
+			while (j < r && t[j].parent == selected_obj) {
+				if (jsoneq(json, &t[j], "x") == 0) {
+					char buf[16];
+					int len = t[j+1].end - t[j+1].start;
+					memcpy(buf, json + t[j+1].start, len);
+					buf[len] = '\0';
+					rms_x = atof(buf);
+					j += 2;
+				}
+				else if (jsoneq(json, &t[j], "y") == 0) {
+					char buf[16];
+					int len = t[j+1].end - t[j+1].start;
+					memcpy(buf, json + t[j+1].start, len);
+					buf[len] = '\0';
+					rms_y = atof(buf);
+					j += 2;
+				}
+				else if (jsoneq(json, &t[j], "z") == 0) {
+					char buf[16];
+					int len = t[j+1].end - t[j+1].start;
+					memcpy(buf, json + t[j+1].start, len);
+					buf[len] = '\0';
+					rms_z = atof(buf);
+					j += 2;
+				}
+			}
+		}
+	}
+
+	// Store in top local RMS
+	storeLocalTopRMS(rms_x, rms_y, rms_z);
+}
+
+void handle_alert(const char *json){
+
+}
 /* USER CODE END 0 */
 
 /**
@@ -326,11 +462,11 @@ int main(void)
   osThreadDef(presenceBroadcastTask, StartPresenceBroadcastTask,osPriorityBelowNormal, 0, 256);
   presenceBroadcastTaskHandle = osThreadCreate(osThread(presenceBroadcastTask), NULL);
 
-  osThreadDef(listenDataRequestTask, StartListenDataRequestTask,osPriorityAboveNormal, 0, 256);
-  listenDataRequestTaskHandle = osThreadCreate(osThread(listenDataRequestTask), NULL);
+  osThreadDef(listenNetworkTask, StartListenNetworkTaskHandle,osPriorityAboveNormal, 0, 256);
+  listenNetworkTaskHandle = osThreadCreate(osThread(listenNetworkTask), NULL);
 
-  osThreadDef(sendsDataMessageTask, StartSendsDataMessageTask, osPriorityNormal, 0, 256);
-  sendsDataMessageTaskHandle = osThreadCreate(osThread(sendsDataMessageTask), NULL);
+  osThreadDef(sendDataRequestTask, StartSendDataRequestTaskHandle, osPriorityNormal, 0, 256);
+  sendDataRequestTaskHandle = osThreadCreate(osThread(sendDataRequestTask), NULL);
 
 
   /* ====================================================================== */
@@ -771,8 +907,31 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 /* ======================= USER FUNCTION DEFINITIONS ======================= */
 
-void storeRemoteTopRMS(){
+void storeLocalTopRMS(float rms_x, float rms_y, float rms_z){
+	float sqrtXYZ [3] = {rms_x,rms_y,rms_z};
 
+	// Check if new value is higher than stored values (assuming initially stored all 0.0)
+	for (int j = 0; j < 3; j++) {
+		int minIndex = 0;
+		for (int i = 1; i < 10; i++) {
+			if (topLocalRMS[i][j] < topLocalRMS[minIndex][j]) {
+				minIndex = i;
+			}
+		}
+		if (sqrtXYZ[j] > topLocalRMS[minIndex][j]) {
+			topLocalRMS[minIndex][j] = sqrtXYZ[j];
+		}
+	}
+	log_message("======= TOP 10 LOCAL RMS VALUES =======");
+	for (int i = 0; i < 10; i++)
+	{
+		log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
+					i,
+					topLocalRMS[i][0],
+					topLocalRMS[i][1],
+					topLocalRMS[i][2]);
+	}
+	log_message("========================================");
 }
 void framWriteTop10ToFRAM(void){
 
@@ -799,30 +958,8 @@ void computeRMS(void){
 	sqrtY = sqrtf(sumY / 100.0f);
 	sqrtZ = sqrtf(sumZ / 100.0f);
 	log_message("RMS computed over 1s window: X=%.4f  Y=%.4f  Z=%.4f", sqrtX, sqrtY, sqrtZ);
-	float sqrtXYZ [3] = {sqrtX,sqrtY,sqrtZ};
 
-	// Check if new value is higher than stored values (assuming initially stored all 0.0)
-	for (int j = 0; j < 3; j++) {
-		int minIndex = 0;
-		for (int i = 1; i < 10; i++) {
-			if (topLocalRMS[i][j] < topLocalRMS[minIndex][j]) {
-				minIndex = i;
-			}
-		}
-		if (sqrtXYZ[j] > topLocalRMS[minIndex][j]) {
-			topLocalRMS[minIndex][j] = sqrtXYZ[j];
-		}
-	}
-	log_message("======= TOP 10 LOCAL RMS VALUES =======");
-	for (int i = 0; i < 10; i++)
-	{
-		log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
-					i,
-					topLocalRMS[i][0],
-					topLocalRMS[i][1],
-					topLocalRMS[i][2]);
-	}
-	log_message("========================================");
+	storeLocalTopRMS(sqrtX, sqrtY, sqrtZ);
 }
 
 void log_message(const char *format, ...)
@@ -1041,7 +1178,6 @@ void StartPresenceBroadcastTask(void const *argument)
     	char msg[128];
 		char ip_str[16];
 		char timestamp[32];
-//      int len = snprintf(msg, sizeof(msg), "Hello from %s", node_id);
 
 		ipaddr_ntoa_r(netif_ip4_addr(netif_default), ip_str, sizeof(ip_str));
 		snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
@@ -1076,7 +1212,7 @@ void StartPresenceBroadcastTask(void const *argument)
 
 
 
-void StartListenDataRequestTask(void const * argument) // Server Listening incoming data request
+void StartListenNetworkTaskHandle(void const * argument) // Server Listening incoming json msg on port 12345
 {
 	static struct udp_pcb *server_pcb;
 	static err_t err;
@@ -1091,14 +1227,14 @@ void StartListenDataRequestTask(void const * argument) // Server Listening incom
 		vTaskDelete(NULL);
 	}
 
-	err = udp_bind(server_pcb, IP_ADDR_ANY, 12345); // Server listen on port 12345
+	err = udp_bind(server_pcb, IP_ADDR_ANY, BROADCAST_PORT); // Server listen on port 12345
 	if (err != ERR_OK) {
 		log_message("udp_bind failed: %d", err);
 		udp_remove(server_pcb);
 		vTaskDelete(NULL);
 	}
 
-	udp_recv(server_pcb, udp_receive_callback, NULL); // Callback send localData to request node
+	udp_recv(server_pcb, udp_receive_callback, NULL); // Callback function
 
 	log_message("UDP server listening on port 12345");
 
@@ -1107,9 +1243,60 @@ void StartListenDataRequestTask(void const * argument) // Server Listening incom
     }
 }
 
-void StartSendsDataMessageTask(void const * argument)
+void StartSendDataRequestTaskHandle(void const * argument) // Client send data_request to all nodes
 {
-    for(;;) { osDelay(1); }
+//	static bool heapSizeChecked = false;
+//	static struct udp_pcb *client_pcb;
+//	static err_t err;
+//
+//	while (!netif_is_up(&gnetif)) {
+//		osDelay(100);
+//	}
+//
+//	client_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+//	if (!client_pcb) {
+//		log_message("udp_new failed");
+//		vTaskDelete(NULL);
+//	}
+//
+//	err = udp_bind(client_pcb, IP_ADDR_ANY, BROADCAST_PORT); // Client send to port 12345
+//	if (err != ERR_OK) {
+//		log_message("udp_bind failed: %d", err);
+//		udp_remove(client_pcb);
+//		vTaskDelete(NULL);
+//	}
+
+
+    for(;;) {
+//    	char msg[128];
+//		char timestamp[32];
+//
+//		snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
+//
+//		int len = snprintf(msg, sizeof(msg),
+//						   "{"
+//							 "\"type\":\"data_request\","
+//							 "\"from\":\"%s\","
+//							 "\"to\":\"%s\","
+//							 "\"timestamp\":\"%s\""
+//						   "}",
+//						   node_id,
+//						   nodeDest_id,
+//						   timestamp);
+//
+//		struct pbuf *pb = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
+//		memcpy(pb->payload, msg, len);
+//
+//		err = udp_sendto(pcb, pb, &dest_ip, BROADCAST_PORT);
+//		pbuf_free(pb);
+//
+//		log_message("Presence message sent (err=%d)", err);
+//		if(!heapSizeChecked){
+//			UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(acquisitionTaskHandle);
+//			log_message("PresenceBroadcastTask min free : %lu words\r\n",uxHighWaterMark);
+//			heapSizeChecked = true;
+    	osDelay(1);
+    }
 }
 
 
