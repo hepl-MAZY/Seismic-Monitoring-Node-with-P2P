@@ -150,7 +150,7 @@ void StartDefaultTask(void const * argument);
 /* USER CODE BEGIN PFP */
 /* --- Functions --- */
 extern void log_message(const char *format, ...);
-void storeLocalTopRMS(float rms_x, float rms_y,float rms_z);
+void updateTopRMS(float table[10][3],float rms_x, float rms_y, float rms_z);
 void alarmTrigger(void);
 void computeRMS();
 void handle_presence(const char *json);
@@ -159,7 +159,7 @@ void handle_data_response(const char *json);
 void handle_alert(const char *json);
 err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err);
 err_t tcp_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err);
-err_t tcp_client_connected(void *arg, struct tcp_pcb *pcb, err_t err);
+static err_t tcp_client_connected(void *arg, struct tcp_pcb *pcb, err_t err);
 const char* determineADCDataStatus(float x, float y, float z);
 
 /* --- General tasks --- */
@@ -194,8 +194,9 @@ static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
 }
 
 /* ============================= Function Callbacks ===============================*/
-err_t tcp_client_connected(void *arg, struct tcp_pcb *pcb, err_t err)
+static err_t tcp_client_connected(void *arg, struct tcp_pcb *pcb, err_t err)
 {
+	// loop node count times
     if (err != ERR_OK) {
         tcp_close(pcb);
         return err;
@@ -386,12 +387,12 @@ void handle_data_response(const char *json){
 	float rms_y = 0.0f;
 	float rms_z = 0.0f;
 	jsmn_parser p;
-	jsmntok_t t [16];
+	jsmntok_t t [36];
 	char status [16];
 	char nucleoID [16];
 
 	jsmn_init(&p);
-	int r = jsmn_parse(&p, json, strlen(json), t, 16); // json item count
+	int r = jsmn_parse(&p, json, strlen(json), t, 36); // json item count
 	if (r < 0) return;
 
 	for (int i = 1; i < r; i++) {
@@ -426,7 +427,7 @@ void handle_data_response(const char *json){
 				}
 			}
 		}
-		if (jsoneq(json, &t[i], "Status") == 0) {
+		if (jsoneq(json, &t[i], "status") == 0) {
 			char buf[16];
 			int len = t[i+1].end - t[i+1].start;
 			memcpy(buf, json + t[i+1].start, len);
@@ -443,9 +444,24 @@ void handle_data_response(const char *json){
 			i++;
 		}
 	}
-
+	log_message("Data_response from %s: rms=(%.4f, %.4f, %.4f) status=%s",nucleoID, rms_x, rms_y, rms_z, status);
 	// Store remote RMS values to struct
-
+	for(int i=0;i<node_count;i++){
+		if(strstr(nucleoID,nodes[i].id)){
+			updateTopRMS(nodes[i].topRMS,rms_x, rms_y, rms_z);
+			log_message("======= TOP 10 REMOTE RMS VALUES of %s =======",nodes[i].id);
+			for (int j = 0; j < 10; j++)
+			{
+				log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
+							j,
+							nodes[i].topRMS[j][0],
+							nodes[i].topRMS[j][1],
+							nodes[i].topRMS[j][2]);
+			}
+			log_message("========================================");
+			break;
+		}
+	}
 	// If all nodes return "alert" status & current status also, then trigger alarm
 
 }
@@ -1045,19 +1061,19 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 /* ======================= USER FUNCTION DEFINITIONS ======================= */
 
-void storeLocalTopRMS(float rms_x, float rms_y, float rms_z){
+void updateTopRMS(float table[10][3],float rms_x, float rms_y, float rms_z){
 	float sqrtXYZ [3] = {rms_x,rms_y,rms_z};
 
 	// Check if new value is higher than stored values (assuming initially stored all 0.0)
 	for (int j = 0; j < 3; j++) {
 		int minIndex = 0;
 		for (int i = 1; i < 10; i++) {
-			if (topLocalRMS[i][j] < topLocalRMS[minIndex][j]) {
+			if (table[i][j] < table[minIndex][j]) {
 				minIndex = i;
 			}
 		}
-		if (sqrtXYZ[j] > topLocalRMS[minIndex][j]) {
-			topLocalRMS[minIndex][j] = sqrtXYZ[j];
+		if (sqrtXYZ[j] > table[minIndex][j]) {
+			table[minIndex][j] = sqrtXYZ[j];
 		}
 	}
 //	log_message("======= TOP 10 LOCAL RMS VALUES =======");
@@ -1093,7 +1109,7 @@ void computeRMS(){
 	sqrtZ = sqrtf(sumZ / 10.0f);
 	log_message("RMS computed over 1s window: X=%.4f  Y=%.4f  Z=%.4f", sqrtX, sqrtY, sqrtZ);
 
-	storeLocalTopRMS(sqrtX, sqrtY, sqrtZ);
+	updateTopRMS(topLocalRMS, sqrtX, sqrtY, sqrtZ);
 }
 
 void log_message(const char *format, ...)
@@ -1280,8 +1296,11 @@ void StartTCPClientDataSyncTask(void const * argument)
 {
 	for (;;)
 	{
+		log_message("\n\n ==============> SYNC DATA ROUTINE <============= \r\n");
+		log_message("Known nodes: %d", node_count);
 		// TCP client request every 60s data from all known nodes, fetch data_response and detection check + store RMS if > current top 10
 		for(int i=0;i<node_count;i++){
+			char ip_str[16];
 			struct tcp_pcb *server_pcb;
 
 			while (!netif_is_up(&gnetif)) {
@@ -1297,6 +1316,11 @@ void StartTCPClientDataSyncTask(void const * argument)
 				log_message("tcp_connect failed: %d", err);
 				tcp_abort(server_pcb);
 			}
+			else{
+				ipaddr_ntoa_r(&nodes[i].ip, ip_str, sizeof(ip_str));
+				log_message("TCP client requested connection to %s with IP : %s \r\n",nodes[i].id, ip_str);
+			}
+
 
 		}
 		osDelay(60000); // sync data with all nodes every 60s
@@ -1318,13 +1342,13 @@ void StartPresenceBroadcastTask(void const *argument)
 
     pcb = udp_new_ip_type(IPADDR_TYPE_V4);
     if (!pcb) {
-        log_message("udp_new failed");
+        log_message("udp_new failed\r\n");
         vTaskDelete(NULL);
     }
 
     err = udp_bind(pcb, IP_ADDR_ANY, 0);
     if (err != ERR_OK) {
-        log_message("udp_bind failed: %d", err);
+        log_message("udp_bind failed: %d\r\n", err);
         udp_remove(pcb);
         vTaskDelete(NULL);
     }
