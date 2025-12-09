@@ -88,9 +88,10 @@ volatile uint8_t flagConversion=0;
 uint16_t rawADC [30];
 float rawADC_x[10], rawADC_y[10], rawADC_z[10];
 float meanADCx, meanADCy, meanADCz = 0.0f;
-float sqrtX, sqrtY, sqrtZ = 0.0f; //RMS
+float sqrtX, sqrtY, sqrtZ = 0.0f;
+float prev_rmsX, prev_rmsY, prev_rmsZ = 0.0f;
 float topLocalRMS [10][3];
-float meanBufX[100], meanBufY[100], meanBufZ[100]; // To store mean vals (100 vals for 1s window)
+float meanBufX[100], meanBufY[100], meanBufZ[100]; // To store mean vals (10 vals for 1s window)
 int meanIndex = 0;
 const char* currentStatus;
 
@@ -98,6 +99,7 @@ const char* currentStatus;
 typedef struct {
     char id[20];
     ip_addr_t ip;
+    float topRMS[10][3];
 } NodeInfo;
 
 static const char node_id[] = "nucleo-6";
@@ -149,15 +151,15 @@ void StartDefaultTask(void const * argument);
 /* --- Functions --- */
 extern void log_message(const char *format, ...);
 void storeLocalTopRMS(float rms_x, float rms_y,float rms_z);
-void framWriteTop10ToFRAM(void);                  // writes local table to FRAM
-void framWriteRemoteRMSToFRAM(void);             // writes remote table to FRAM
 void alarmTrigger(void);
+void computeRMS();
 void handle_presence(const char *json);
 void handle_data_request(struct tcp_pcb *pcb);
 void handle_data_response(const char *json);
 void handle_alert(const char *json);
 err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err);
 err_t tcp_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err);
+err_t tcp_client_connected(void *arg, struct tcp_pcb *pcb, err_t err);
 const char* determineADCDataStatus(float x, float y, float z);
 
 /* --- General tasks --- */
@@ -192,6 +194,22 @@ static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
 }
 
 /* ============================= Function Callbacks ===============================*/
+err_t tcp_client_connected(void *arg, struct tcp_pcb *pcb, err_t err)
+{
+    if (err != ERR_OK) {
+        tcp_close(pcb);
+        return err;
+    }
+
+    const char *msg = "{\"type\":\"data_request\"}";
+    tcp_write(pcb, msg, strlen(msg), TCP_WRITE_FLAG_COPY);
+    tcp_output(pcb);
+
+    tcp_recv(pcb, tcp_recv_cb); // Data_response will be sent receive callback
+
+    return ERR_OK;
+}
+
 void udp_receive_callback(void *arg, struct udp_pcb *pcb,struct pbuf *p, const ip_addr_t *addr, u16_t port)
 {
 	char jsonPayload[256];
@@ -259,7 +277,12 @@ err_t tcp_recv_cb(void *arg, struct tcp_pcb *pcb,struct pbuf *p, err_t err)
     if (strstr(jsonPayload, "data_request")){
         handle_data_request(pcb);
         return ERR_OK;
-    }else{
+    }
+    else if (strstr(jsonPayload, "data_response")){
+    	handle_data_response(jsonPayload);
+		return ERR_OK;
+    }
+    else{
 		log_message("JSON payload invalid type\r\n");
 	}
     tcp_close(pcb);
@@ -322,7 +345,7 @@ void handle_data_request(struct tcp_pcb *pcb)
     char response[200];
     char timestamp[32];
     char type[]  = "data_response";
-    const char* status = determineADCDataStatus(meanADCx,meanADCy,meanADCz);
+    const char* status = determineADCDataStatus(sqrtX,sqrtY,sqrtZ);
 
     snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
 
@@ -339,7 +362,7 @@ void handle_data_request(struct tcp_pcb *pcb)
                               "\"Status\":\"%s\""
                             "}",
                             type, node_id, timestamp,
-							meanADCx, meanADCy, meanADCz,
+							sqrtX, sqrtY, sqrtZ,
                             status);
 
     err_t err = tcp_write(pcb, response, resp_len, TCP_WRITE_FLAG_COPY);
@@ -357,12 +380,15 @@ void handle_data_request(struct tcp_pcb *pcb)
 
 
 void handle_data_response(const char *json){
-	// Extract remote RMS vals and store in local if in top 10
+	// Extract remote RMS vals and store in data struct NodeInfo (matrix 10x3)
+	// This data_response will be called x nodes times (client request loop)
 	float rms_x = 0.0f;
 	float rms_y = 0.0f;
 	float rms_z = 0.0f;
 	jsmn_parser p;
-	jsmntok_t t[16];
+	jsmntok_t t [16];
+	char status [16];
+	char nucleoID [16];
 
 	jsmn_init(&p);
 	int r = jsmn_parse(&p, json, strlen(json), t, 16); // json item count
@@ -400,9 +426,28 @@ void handle_data_response(const char *json){
 				}
 			}
 		}
+		if (jsoneq(json, &t[i], "Status") == 0) {
+			char buf[16];
+			int len = t[i+1].end - t[i+1].start;
+			memcpy(buf, json + t[i+1].start, len);
+			buf[len] = '\0';
+			strcpy(status,buf);
+			i++;
+		}
+		if (jsoneq(json, &t[i], "id") == 0) {
+			char buf[16];
+			int len = t[i+1].end - t[i+1].start;
+			memcpy(buf, json + t[i+1].start, len);
+			buf[len] = '\0';
+			strcpy(nucleoID,buf);
+			i++;
+		}
 	}
 
-	storeLocalTopRMS(rms_x, rms_y, rms_z);
+	// Store remote RMS values to struct
+
+	// If all nodes return "alert" status & current status also, then trigger alarm
+
 }
 
 void handle_alert(const char *json){
@@ -411,37 +456,35 @@ void handle_alert(const char *json){
 
 const char* determineADCDataStatus(float x, float y, float z)
 {
-	/* To determine unstable activity, the most recent sampled mean should be compared to the previous RMS value (taken 1s window)
+	/* To determine unstable activity, the most recent sampled RMS should be compared to the previous RMS value (taken 1s window)
 	=> This allows us to see any change compared to previous data
-	=> Mean and RMS would have a significant difference if seismic activity detected
-	=> Previous status is saved ( activity detected or not )
-	=> Passed in arguments could be the mean or raw values NOT RMS
-	NOT DONE YET*/
+	=> Previous RMS and new RMS would have a significant difference if seismic activity detected
+	*/
 
-	float warning_DeltaMeanRMS = 0.5f; // Dummy data
-	float max_DeltaMeanRMS = 1.0f; // Dummy data
-	float deltaMeanRMS = 0.0f;
+	float warning_DeltaRMS = 0.5f; // Dummy data
+	float max_DeltaRMS = 1.0f; // Dummy data
+	float deltaRMS = 0.0f;
 	float maxOfXYZ = 0.0f;
 	float rms = 0.0f;
 
 	if (x > maxOfXYZ) {
 		maxOfXYZ = x;
-		rms = sqrtX;
+		rms = prev_rmsX;
 	}
 	if (y > maxOfXYZ) {
 		maxOfXYZ = y;
-		rms = sqrtY;
+		rms = prev_rmsY;
 	}
 	if (z > maxOfXYZ) {
 		maxOfXYZ = z;
-		rms = sqrtZ;
+		rms = prev_rmsZ;
 	}
 
-	deltaMeanRMS = fabsf(rms - maxOfXYZ);
-	if( deltaMeanRMS < warning_DeltaMeanRMS ){
+	deltaRMS = fabsf(rms - maxOfXYZ);
+	if( deltaRMS < warning_DeltaRMS ){
 		return "OK";
 	}
-	else if( warning_DeltaMeanRMS <= deltaMeanRMS && deltaMeanRMS < max_DeltaMeanRMS ){
+	else if( warning_DeltaRMS <= deltaRMS && deltaRMS < max_DeltaRMS ){
 		return "warning";
 	}
 	else{
@@ -1017,42 +1060,37 @@ void storeLocalTopRMS(float rms_x, float rms_y, float rms_z){
 			topLocalRMS[minIndex][j] = sqrtXYZ[j];
 		}
 	}
-	log_message("======= TOP 10 LOCAL RMS VALUES =======");
-	for (int i = 0; i < 10; i++)
-	{
-		log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
-					i,
-					topLocalRMS[i][0],
-					topLocalRMS[i][1],
-					topLocalRMS[i][2]);
-	}
-	log_message("========================================");
+//	log_message("======= TOP 10 LOCAL RMS VALUES =======");
+//	for (int i = 0; i < 10; i++)
+//	{
+//		log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
+//					i,
+//					topLocalRMS[i][0],
+//					topLocalRMS[i][1],
+//					topLocalRMS[i][2]);
+//	}
+//	log_message("========================================");
 }
 
-void framWriteTop10ToFRAM(void){
-
-}
-void framWriteRemoteRMSToFRAM(void){
-
-}
 
 void alarmTrigger(void){
 	HAL_GPIO_TogglePin(GPIOB, AlarmLED_Pin);
 	osDelay(400);
 }
 
-void computeRMS(void){
+void computeRMS(){
 	// store new local top 10 rms vals to topLocalRMS data taken from meanBufX[100], meanBufY[100], meanBufZ[100];
+
 	float sumX, sumY, sumZ = 0.0f;
 
-	for(int i=0; i<100;i++){
+	for(int i=0; i<10;i++){
 		sumX += meanBufX[i] * meanBufX[i];
 		sumY += meanBufY[i] * meanBufY[i];
 		sumZ += meanBufZ[i] * meanBufZ[i];
 	}
-	sqrtX = sqrtf(sumX / 100.0f);
-	sqrtY = sqrtf(sumY / 100.0f);
-	sqrtZ = sqrtf(sumZ / 100.0f);
+	sqrtX = sqrtf(sumX / 10.0f);
+	sqrtY = sqrtf(sumY / 10.0f);
+	sqrtZ = sqrtf(sumZ / 10.0f);
 	log_message("RMS computed over 1s window: X=%.4f  Y=%.4f  Z=%.4f", sqrtX, sqrtY, sqrtZ);
 
 	storeLocalTopRMS(sqrtX, sqrtY, sqrtZ);
@@ -1192,12 +1230,15 @@ void StartAcquisitionTask(void const * argument)
 			meanBufY[meanIndex] = meanADCy;
 			meanBufZ[meanIndex] = meanADCz;
 			meanIndex++;
-			if(meanIndex==100){
-				meanIndex=0; // Reset after storing 100 mean vals
-				log_message("100 mean data samples acquired => computing RMS (1s window)\r\n");
+			if(meanIndex==10){
+				meanIndex=0; // Reset after storing 10 mean vals
+				log_message("10 mean data samples acquired => computing RMS (1s window)\r\n");
 				computeRMS();
-				currentStatus = determineADCDataStatus(meanADCx,meanADCy,meanADCz);
-				log_message("Current status : %s \r\n",currentStatus);
+				currentStatus = determineADCDataStatus(sqrtX,sqrtY,sqrtZ);
+				log_message("Current Status : %s \r\n",currentStatus);
+				prev_rmsX=sqrtX;
+				prev_rmsY=sqrtY;
+				prev_rmsZ=sqrtZ;
 			}
 
 			if(!heapSizeChecked){
@@ -1239,9 +1280,29 @@ void StartTCPClientDataSyncTask(void const * argument)
 {
 	for (;;)
 	{
-		}
+		// TCP client request every 60s data from all known nodes, fetch data_response and detection check + store RMS if > current top 10
+		for(int i=0;i<node_count;i++){
+			struct tcp_pcb *server_pcb;
 
+			while (!netif_is_up(&gnetif)) {
+				osDelay(100);
+			}
+
+			server_pcb = tcp_new();
+			if (!server_pcb)log_message("tcp_new failed");
+
+			err_t err = tcp_connect(server_pcb,&nodes[i].ip, LISTEN_PORT, tcp_client_connected); // callback when connected
+
+			if(err != ERR_OK ){
+				log_message("tcp_connect failed: %d", err);
+				tcp_abort(server_pcb);
+			}
+
+		}
 		osDelay(60000); // sync data with all nodes every 60s
+
+	}
+
 }
 
 void StartPresenceBroadcastTask(void const *argument)
@@ -1302,7 +1363,7 @@ void StartPresenceBroadcastTask(void const *argument)
 			log_message("PresenceBroadcastTask min free : %lu words\r\n",uxHighWaterMark);
 			heapSizeChecked = true;
 		}
-        osDelay(10000); // Every 10s
+        osDelay(10000); // Every 10s => sync data every 60 s, thus nucleo should have the remote nucleo's info locally as NodeInfo struct before handling data_response
     }
 }
 
