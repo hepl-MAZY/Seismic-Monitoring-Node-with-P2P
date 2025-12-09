@@ -1,7 +1,7 @@
 import socket
 import json
 
-NUCLEO_IP = "192.168.1.222"   
+NUCLEO_IP = "192.168.1.226"   
 NUCLEO_PORT = 12345       
 
 data_request = {
