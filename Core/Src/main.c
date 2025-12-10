@@ -94,6 +94,7 @@ float topLocalRMS [10][3];
 float meanBufX[100], meanBufY[100], meanBufZ[100]; // To store mean vals (10 vals for 1s window)
 int meanIndex = 0;
 const char* currentStatus;
+bool triggerAlarm = false;
 
 /* Network variables */
 typedef struct {
@@ -151,7 +152,6 @@ void StartDefaultTask(void const * argument);
 /* --- Functions --- */
 extern void log_message(const char *format, ...);
 void updateTopRMS(float table[10][3],float rms_x, float rms_y, float rms_z);
-void alarmTrigger(void);
 void computeRMS();
 void handle_presence(const char *json);
 void handle_data_request(struct tcp_pcb *pcb);
@@ -383,6 +383,8 @@ void handle_data_request(struct tcp_pcb *pcb)
 void handle_data_response(const char *json){
 	// Extract remote RMS vals and store in data struct NodeInfo (matrix 10x3)
 	// This data_response will be called x nodes times (client request loop)
+	static uint8_t nodeAlertCount = 0;
+	static uint8_t nodeCountTrack = 0;
 	float rms_x = 0.0f;
 	float rms_y = 0.0f;
 	float rms_z = 0.0f;
@@ -459,11 +461,29 @@ void handle_data_response(const char *json){
 							nodes[i].topRMS[j][2]);
 			}
 			log_message("========================================");
+			nodeCountTrack++;
+			log_message("========> Number of nodes sent DATA request : %d (Known nodes count = %d\r\n",nodeCountTrack,node_count);
+			if(strcmp(status,"alert")==0){
+				nodeAlertCount++;
+			}
 			break;
 		}
 	}
 	// If all nodes return "alert" status & current status also, then trigger alarm
-
+	if(node_count == nodeCountTrack){
+		nodeCountTrack = 0;
+		nodeAlertCount = 0;
+		if( node_count == nodeAlertCount && strcmp(currentStatus,"alert") == 0 ){ // all nodes were looped through and sent "alert" status
+			log_message("\n ======================================== \r\n");
+			log_message("\n\n All nodes send an alert status! \r\n");
+			triggerAlarm = true;
+		}
+		else{
+			log_message("\n ======================================== \r\n");
+			log_message("\n\n STATUS NORMAL OVERALL \r\n");
+			triggerAlarm = false;
+		}
+	}
 }
 
 void handle_alert(const char *json){
@@ -498,7 +518,7 @@ const char* determineADCDataStatus(float x, float y, float z)
 
 	deltaRMS = fabsf(rms - maxOfXYZ);
 	if( deltaRMS < warning_DeltaRMS ){
-		return "OK";
+		return "normal";
 	}
 	else if( warning_DeltaRMS <= deltaRMS && deltaRMS < max_DeltaRMS ){
 		return "warning";
@@ -1089,11 +1109,6 @@ void updateTopRMS(float table[10][3],float rms_x, float rms_y, float rms_z){
 }
 
 
-void alarmTrigger(void){
-	HAL_GPIO_TogglePin(GPIOB, AlarmLED_Pin);
-	osDelay(400);
-}
-
 void computeRMS(){
 	// store new local top 10 rms vals to topLocalRMS data taken from meanBufX[100], meanBufY[100], meanBufZ[100];
 
@@ -1269,10 +1284,8 @@ void StartAcquisitionTask(void const * argument)
 
 void StartDetectionTask(void const * argument){
 	for(;;){
-		// Check computed RMS
-//		alarmTrigger();
-
-		osDelay(1);
+		if(triggerAlarm)HAL_GPIO_TogglePin(GPIOB, AlarmLED_Pin);
+		osDelay(400);
 	}
 }
 
