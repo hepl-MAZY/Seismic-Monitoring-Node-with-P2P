@@ -167,7 +167,7 @@ void SystemInit(void)
   *         be used by the user application to setup the SysTick timer or configure
   *         other parameters.
   *           
-  * @note   Each time the core clock (HCLK) changes, this function must be called
+  * @note   Each time the core clock (HCLK) changes, this functtion must be called
   *         to update SystemCoreClock variable value. Otherwise, any configuration
   *         based on this variable will be incorrect.         
   *     

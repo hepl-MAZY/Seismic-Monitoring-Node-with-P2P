@@ -4,7 +4,7 @@ import json
 import time
 import random
 
-SERVER_IP   = "192.168.1.227"       
+SERVER_IP   = "192.168.129.71"       
 SERVER_PORT = 12345
 
 NODE_ID = "pc-client"    

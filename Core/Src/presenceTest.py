@@ -1,8 +1,8 @@
 import socket, json
 
-BROADCAST_ADDR = "192.168.1.255"    
+BROADCAST_ADDR = "192.168.129.255"    
 NUCLEO_PORT    = 12345
-PC_IP          = "192.168.1.227"    
+PC_IP          = "192.168.129.71"    
 
 data_request = {
     "type": "presence",

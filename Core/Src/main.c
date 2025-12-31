@@ -77,8 +77,17 @@ osThreadId defaultTaskHandle;
 #define MAX_MSG_LEN 128
 #define NTP_SERVER "pool.ntp.org"
 #define NTP_PORT 123
-#define NTP_TIMESTAMP_DELTA 2208988800UL
+#define NTP_TO_UNIX 2208988800UL
+#define NTP_PACKET_SIZE 48
 #define MAX_NODES 10
+#define FRAM_NODE_TABLE_BASE   0x000000u
+#define FRAM_SLOT_SIZE         256u
+#define NODE_ID_SIZE 20
+#define NODE_PREFIX "nucleo"
+#define NODE_PREFIX_LEN (sizeof(NODE_PREFIX) - 1)
+#define SET_NODE_COUNT(v) do { node_count = (v); log_message("node_count=%lu @%s:%d\r\n",(unsigned long)node_count,__FILE__,__LINE__);} while(0)
+#define INC_NODE_COUNT()  do { node_count++;        log_message("node_count=%lu @%s:%d\r\n",(unsigned long)node_count,__FILE__,__LINE__);} while(0)
+
 
 /* Global variables */
 volatile bool buttonPressed = false;
@@ -95,17 +104,30 @@ float meanBufX[100], meanBufY[100], meanBufZ[100]; // To store mean vals (10 val
 int meanIndex = 0;
 const char* currentStatus;
 bool triggerAlarm = false;
+static ip_addr_t ntp_ip;
+bool alertStatus = false;
+
 
 /* Network variables */
 typedef struct {
-    char id[20];
+    char id[NODE_ID_SIZE];
     ip_addr_t ip;
     float topRMS[10][3];
 } NodeInfo;
 
-static const char node_id[] = "nucleo-6";
+const char node_id[NODE_ID_SIZE] = "nucleo-6";
 static NodeInfo nodes[MAX_NODES];
-static size_t node_count = 0;
+static uint32_t node_count = 0;
+
+static ip_addr_t ntp_ip;
+static volatile uint8_t dns_done = 0;
+static volatile err_t dns_result = ERR_VAL;
+
+/* Timestamp variables*/
+volatile uint16_t year;
+volatile uint8_t  month, day;
+volatile uint8_t  hour, min, sec;
+volatile uint8_t ntp_time_ok = 0;
 
 /* UART debug structure */
 typedef struct {
@@ -118,7 +140,7 @@ osThreadId masterTaskHandle; // Push button runs/stops specified tasks
 osThreadId heartbeatTaskHandle;
 osThreadId LogMessageTaskHandle;
 osMailQId logMailQId;
-
+osMutexId framMutexHandle;
 
 /* Data Acquisition Task Handling */
 osThreadId acquisitionTaskHandle; // Store raw data AND average over 10 sample per axis
@@ -161,6 +183,10 @@ err_t tcp_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err);
 err_t tcp_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err);
 static err_t tcp_client_connected(void *arg, struct tcp_pcb *pcb, err_t err);
 const char* determineADCDataStatus(float x, float y, float z);
+static uint8_t Dec_To_BCD(uint8_t dec);
+static uint8_t BCD_To_Dec(uint8_t bcd);
+static void dns_cb(const char *name, const ip_addr_t *ipaddr, void *callback_arg);
+static void ntp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port);
 
 /* --- General tasks --- */
 void StartMasterTask(void const * argument);
@@ -194,6 +220,59 @@ static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
 }
 
 /* ============================= Function Callbacks ===============================*/
+
+
+static void dns_cb(const char *name, const ip_addr_t *ipaddr, void *callback_arg)
+{
+    if (ipaddr != NULL) {
+        ntp_ip = *ipaddr;
+        dns_result = ERR_OK;
+    }
+    else {
+        dns_result = ERR_VAL;
+    }
+    dns_done = 1;
+}
+
+static void ntp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                        const ip_addr_t *addr, u16_t port)
+{
+    uint8_t buf[48];
+
+    if (!p) return;
+
+    if (p->tot_len < 48) {
+        pbuf_free(p);
+        return;
+    }
+
+    if (pbuf_copy_partial(p, buf, 48, 0) != 48) {
+        pbuf_free(p);
+        return;
+    }
+
+    pbuf_free(p);
+
+    uint32_t ntp_seconds = ((uint32_t)buf[40] << 24) | ((uint32_t)buf[41] << 16) |((uint32_t)buf[42] << 8)  | ((uint32_t)buf[43]);
+
+    if (ntp_seconds < NTP_TO_UNIX) {
+        log_message("NTP: invalid time");
+    } else {
+        uint32_t unix_time = ntp_seconds - NTP_TO_UNIX;
+        log_message("NTP unix time: %lu", (unsigned long)unix_time);
+        uint32_t belgium_time = unix_time + 3600; // winter + 3600
+        sec  = belgium_time % 60;
+        belgium_time /= 60;
+        min  = belgium_time % 60;
+        belgium_time /= 60;
+        hour = belgium_time % 24;
+        ntp_time_ok = 1;
+    }
+
+    udp_remove(pcb);
+}
+
+
 static err_t tcp_client_connected(void *arg, struct tcp_pcb *pcb, err_t err)
 {
 	// loop node count times
@@ -318,12 +397,13 @@ void handle_presence(const char *json){
 	}
 
 	bool id_exist = false;
-	for(int i=0;i<MAX_NODES;i++){
-		if((strcmp(nodes[i].id, id_buf) == 0)){
-			id_exist = true;
-			break;
-		}
+	for (uint32_t i = 0; i < node_count; i++) {
+	    if (strncmp(nodes[i].id, id_buf, NODE_ID_SIZE) == 0) {
+	        id_exist = true;
+	        break;
+	    }
 	}
+
 
 	if(!id_exist && (node_count < MAX_NODES)){
 		NodeInfo new_node;
@@ -334,6 +414,11 @@ void handle_presence(const char *json){
 		nodes[node_count]=new_node;
 		node_count++;
 		log_message("New presence received, storing IP & ID in local memory : \r\nIP= %s\r\nID= %s",ip_buf, id_buf);
+		/*
+		 * When a node sends presence (new), saves locally ID with empty topRMS array with struct
+		 * Restores any old data from FRAM if node already wrote some data before
+		 */
+		restoringDataFromFRAMForAliveNode(id_buf);
 	}
 	else{
 		log_message("Old presence received, already stored in local memory : \r\nIP= %s\r\nID= %s",ip_buf, id_buf);
@@ -463,12 +548,14 @@ void handle_data_response(const char *json){
 			log_message("========================================");
 			nodeCountTrack++;
 			log_message("========> Number of nodes sent DATA request : %d (Known nodes count = %d\r\n",nodeCountTrack,node_count);
+			updateTableToFRAM(nucleoID); // Update current node local data to FRAM
 			if(strcmp(status,"alert")==0){
 				nodeAlertCount++;
 			}
 			break;
 		}
 	}
+
 	// If all nodes return "alert" status & current status also, then trigger alarm
 	if(node_count == nodeCountTrack){
 		nodeCountTrack = 0;
@@ -492,38 +579,23 @@ void handle_alert(const char *json){
 
 const char* determineADCDataStatus(float x, float y, float z)
 {
-	/* To determine unstable activity, the most recent sampled RMS should be compared to the previous RMS value (taken 1s window)
-	=> This allows us to see any change compared to previous data
-	=> Previous RMS and new RMS would have a significant difference if seismic activity detected
-	*/
+	float warning_sumRMS = 1.6f;
+	float alert_sumRMS = 1.75f;
+	float sumRMS_current = 0.0f;
 
-	float warning_DeltaRMS = 0.5f; // Dummy data
-	float max_DeltaRMS = 1.0f; // Dummy data
-	float deltaRMS = 0.0f;
-	float maxOfXYZ = 0.0f;
-	float rms = 0.0f;
+	sumRMS_current = (x + y + z)/3;
 
-	if (x > maxOfXYZ) {
-		maxOfXYZ = x;
-		rms = prev_rmsX;
-	}
-	if (y > maxOfXYZ) {
-		maxOfXYZ = y;
-		rms = prev_rmsY;
-	}
-	if (z > maxOfXYZ) {
-		maxOfXYZ = z;
-		rms = prev_rmsZ;
-	}
 
-	deltaRMS = fabsf(rms - maxOfXYZ);
-	if( deltaRMS < warning_DeltaRMS ){
+	log_message("========> Sum computed : %.4f",sumRMS_current);
+
+	if(sumRMS_current < warning_sumRMS){
 		return "normal";
 	}
-	else if( warning_DeltaRMS <= deltaRMS && deltaRMS < max_DeltaRMS ){
+	else if(sumRMS_current >= warning_sumRMS && sumRMS_current < alert_sumRMS){
 		return "warning";
 	}
 	else{
+		alertStatus = true;
 		return "alert";
 	}
 
@@ -601,8 +673,12 @@ int main(void)
   /* ========================= RTOS TASKS CREATION ========================= */
 
   /* Stack size for each task is sized depending on Highwatermark value to leave at least 30% free memory on the stack size */
-  osMailQDef(logMailQ, 16, Message_t);
+  osMailQDef(logMailQ, 32, Message_t);
   logMailQId = osMailCreate(osMailQ(logMailQ), NULL);
+
+  osMutexDef(framMutex);
+  framMutexHandle = osMutexCreate(osMutex(framMutex));
+
   /* --- General tasks --- */
   osThreadDef(masterTask, StartMasterTask, osPriorityNormal, 0, 256);
   masterTaskHandle = osThreadCreate(osThread(masterTask), NULL);
@@ -623,10 +699,10 @@ int main(void)
 
 
   /* --- RTC / NTP time sync --- */
-  osThreadDef(syncRTCFromNTPTask, StartSyncRTCFromNTPTask, osPriorityBelowNormal, 0, 128);
+  osThreadDef(syncRTCFromNTPTask, StartSyncRTCFromNTPTask, osPriorityBelowNormal, 0, 256);
   syncRTCFromNTPTaskHandle = osThreadCreate(osThread(syncRTCFromNTPTask), NULL);
 
-  osThreadDef(readTimeFromBQ32000Task, StartReadTimeFromBQ32000Task, osPriorityLow, 0, 128);
+  osThreadDef(readTimeFromBQ32000Task, StartReadTimeFromBQ32000Task, osPriorityBelowNormal, 0, 256);
   readTimeFromBQ32000TaskHandle = osThreadCreate(osThread(readTimeFromBQ32000Task), NULL);
 
   /* --- Network communication tasks --- */
@@ -1034,11 +1110,15 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, HeartbeatLED_Pin|AlarmLED_Pin|LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
@@ -1055,6 +1135,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SPI2_CS_Pin */
+  GPIO_InitStruct.Pin = SPI2_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(SPI2_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : USB_PowerSwitchOn_Pin */
   GPIO_InitStruct.Pin = USB_PowerSwitchOn_Pin;
@@ -1080,6 +1167,246 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /* ======================= USER FUNCTION DEFINITIONS ======================= */
+void print_node(const NodeInfo *node, int index)
+{
+    if (node == NULL) return;
+
+    log_message("Node [%d]:", index);
+    log_message("  IP  : %s", ipaddr_ntoa(&node->ip));
+    log_message("  ID  : %s", node->id);
+
+}
+
+void print_all_nodes(void)
+{
+    log_message("=== Nodes table (count = %d) ===", node_count);
+
+    for (int i = 0; i < node_count; i++) {
+        print_node(&nodes[i], i);
+    }
+
+    log_message("=== End of nodes table ===");
+}
+
+
+static uint8_t BCD_To_Dec(uint8_t bcd)
+{
+    return ((bcd >> 4) * 10) + (bcd & 0x0F);
+}
+
+static uint8_t Dec_To_BCD(uint8_t dec)
+{
+    return ((dec / 10) << 4) | (dec % 10);
+}
+
+
+/* Every data sync routine call, TOP RMS values are updated from all nodes to RMS array struct ==> Update these data from FRAM
+ FRAM addressing : x bits block reserved for each node => node_ID top 10 rms_x top 10 rms_y top 10 rms_z ; node_ID etc....
+ ========= Total Size per slot calculation
+ * NodeID [20] = 20 bytes
+ * float topRMS [10][3] = 30*4 = 120 bytes
+ * CRC32 = 4 bytes
+ * Total per slot ID: 144 bytes => round to 2^8 => 256 bytes per slot
+ */
+void restoringDataFromFRAMForAliveNode(const char *nodeID)
+{
+    osMutexWait(framMutexHandle, osWaitForever);
+
+    char fetched_nodeID[NODE_ID_SIZE + 1];
+    float topRMS[10][3];
+    HAL_StatusTypeDef status;
+
+    log_message("============= > Restoring data for %s", nodeID);
+
+    for (int slot = 0; slot < MAX_NODES; slot++) {
+        uint32_t addr = FRAM_NODE_TABLE_BASE + (uint32_t)slot * FRAM_SLOT_SIZE;
+
+        uint8_t cmd[4] = {
+            0x03,
+            (addr >> 16) & 0xFF,
+            (addr >>  8) & 0xFF,
+            (addr >>  0) & 0xFF
+        };
+
+        HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_RESET);
+        status = HAL_SPI_Transmit(&hspi2, cmd, sizeof(cmd), HAL_MAX_DELAY);
+        if (status != HAL_OK) goto spi_error;
+        status = HAL_SPI_Receive(&hspi2, (uint8_t*)fetched_nodeID, NODE_ID_SIZE, HAL_MAX_DELAY);
+        if (status != HAL_OK) goto spi_error;
+        HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+
+        fetched_nodeID[NODE_ID_SIZE] = '\0';
+
+        if (strncmp(fetched_nodeID, nodeID, NODE_ID_SIZE) == 0) {
+
+            log_message("%s found in FRAM memory ! Fetching data...", nodeID);
+
+            addr += NODE_ID_SIZE;
+            cmd[1] = (addr >> 16) & 0xFF;
+            cmd[2] = (addr >>  8) & 0xFF;
+            cmd[3] = (addr >>  0) & 0xFF;
+
+            HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_RESET);
+            status = HAL_SPI_Transmit(&hspi2, cmd, sizeof(cmd), HAL_MAX_DELAY);
+            if (status != HAL_OK) goto spi_error;
+            status = HAL_SPI_Receive(&hspi2, (uint8_t*)topRMS, sizeof(topRMS), HAL_MAX_DELAY);
+            if (status != HAL_OK) goto spi_error;
+            HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+
+            if (strncmp(nodeID, node_id, NODE_ID_SIZE) == 0) {
+                memcpy(topLocalRMS, topRMS, sizeof(topRMS));
+                log_message("Restored FRAM RMS into LOCAL topLocalRMS for %s", nodeID);
+                osMutexRelease(framMutexHandle);
+                return;
+            }
+
+            for (uint32_t j = 0; j < node_count; j++) {
+                if (strncmp(nodes[j].id, nodeID, NODE_ID_SIZE) == 0) {
+                    memcpy(nodes[j].topRMS, topRMS, sizeof(topRMS));
+                    log_message("Restored FRAM RMS into nodes[%lu].topRMS for %s", (unsigned long)j, nodeID);
+                    osMutexRelease(framMutexHandle);
+                    return;
+                }
+            }
+
+            log_message("Node %s was in FRAM but not in nodes[] yet", nodeID);
+            osMutexRelease(framMutexHandle);
+            return;
+        }
+    }
+
+    log_message("%s not found in FRAM", nodeID);
+    osMutexRelease(framMutexHandle);
+    return;
+
+spi_error:
+    HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+    log_message("SPI error while restoring data");
+    osMutexRelease(framMutexHandle);
+}
+
+
+void updateTableToFRAM(const char *nodeID){
+	osMutexWait(framMutexHandle, osWaitForever);
+    uint8_t wren = 0x06;
+    char fetched_nodeID[NODE_ID_SIZE + 1];
+    HAL_StatusTypeDef status;
+    bool slotFound = false;
+    uint32_t empty_addr = 0;
+    float topRMS[10][3] = {0};
+
+    if (strncmp(nodeID, node_id, NODE_ID_SIZE) == 0) {
+        memcpy(topRMS, topLocalRMS, sizeof(topRMS));   // write local top10 directly
+    } else {
+        bool found = false;
+        for (int j = 0; j < node_count; j++) {
+            if (strncmp(nodes[j].id, nodeID, NODE_ID_SIZE) == 0) {
+                memcpy(topRMS, nodes[j].topRMS, sizeof(topRMS));
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            log_message("updateTableToFRAM: node %s not found in nodes[]; not writing junk.\r\n", nodeID);
+            osMutexRelease(framMutexHandle);
+            return;
+        }
+    }
+
+    for (int i = 0; i < MAX_NODES; i++) {
+        uint32_t addr_point = FRAM_NODE_TABLE_BASE + (uint32_t)i * FRAM_SLOT_SIZE;
+
+        uint8_t pReadCommand[4];
+        pReadCommand[0] = 0x03;
+        pReadCommand[1] = (addr_point >> 16) & 0xFF;
+        pReadCommand[2] = (addr_point >>  8) & 0xFF;
+        pReadCommand[3] = (addr_point >>  0) & 0xFF;
+
+        // READ node ID
+        HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_RESET);
+        status = HAL_SPI_Transmit(&hspi2, pReadCommand, sizeof(pReadCommand), HAL_MAX_DELAY);
+        if (status != HAL_OK) goto spi_error;
+        status = HAL_SPI_Receive(&hspi2, (uint8_t*)fetched_nodeID, NODE_ID_SIZE, HAL_MAX_DELAY);
+        if (status != HAL_OK) goto spi_error;
+        HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+
+        // If fetchednodeID is empty = empty slot
+        if (!slotFound && memcmp(fetched_nodeID, NODE_PREFIX, NODE_PREFIX_LEN) != 0) {
+            empty_addr = addr_point;
+            slotFound = true;
+        }
+
+        fetched_nodeID[NODE_ID_SIZE] = '\0';
+
+        // if node exists -> update in place (NO duplicate)
+        if (strncmp(fetched_nodeID, nodeID, NODE_ID_SIZE) == 0) {
+        	log_message("Node ID already exist in FRAM memory, overwriting data...\r\n\n");
+            uint32_t data_addr = addr_point + NODE_ID_SIZE;
+
+            uint8_t pWriteCommand[4];
+            pWriteCommand[0] = 0x02;
+            pWriteCommand[1] = (data_addr >> 16) & 0xFF;
+            pWriteCommand[2] = (data_addr >>  8) & 0xFF;
+            pWriteCommand[3] = (data_addr >>  0) & 0xFF;
+
+            // WREN
+            HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_RESET);
+            status = HAL_SPI_Transmit(&hspi2, &wren, 1, HAL_MAX_DELAY);
+            if (status != HAL_OK) goto spi_error;
+            HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+
+            // WRITE topRMS
+            HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_RESET);
+            status = HAL_SPI_Transmit(&hspi2, pWriteCommand, sizeof(pWriteCommand), HAL_MAX_DELAY);
+            if (status != HAL_OK) goto spi_error;
+            status = HAL_SPI_Transmit(&hspi2, (uint8_t*)topRMS, sizeof(topRMS), HAL_MAX_DELAY);
+            if (status != HAL_OK) goto spi_error;
+            HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+            osMutexRelease(framMutexHandle);
+            return;
+        }
+    }
+
+
+    // node not found -> create it in first empty slot
+    if (slotFound) {
+    	log_message("Node ID doesn't exist in FRAM memory, writing data to empty slot! \r\n\n");
+        uint8_t pWriteCommand[4];
+        pWriteCommand[0] = 0x02;
+        pWriteCommand[1] = (empty_addr >> 16) & 0xFF;
+        pWriteCommand[2] = (empty_addr >>  8) & 0xFF;
+        pWriteCommand[3] = (empty_addr >>  0) & 0xFF;
+
+        // WREN
+        HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_RESET);
+        status = HAL_SPI_Transmit(&hspi2, &wren, 1, HAL_MAX_DELAY);
+        if (status != HAL_OK) goto spi_error;
+        HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+
+        // WRITE nodeID then topRMS
+        HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_RESET);
+        status = HAL_SPI_Transmit(&hspi2, pWriteCommand, sizeof(pWriteCommand), HAL_MAX_DELAY);
+        if (status != HAL_OK) goto spi_error;
+        status = HAL_SPI_Transmit(&hspi2, (uint8_t*)nodeID, NODE_ID_SIZE, HAL_MAX_DELAY);
+        if (status != HAL_OK) goto spi_error;
+        status = HAL_SPI_Transmit(&hspi2, (uint8_t*)topRMS, sizeof(topRMS), HAL_MAX_DELAY);
+        if (status != HAL_OK) goto spi_error;
+        HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+        osMutexRelease(framMutexHandle);
+        return;
+    }
+
+    log_message("No slots available to write to FRAM for %s\r\n", nodeID);
+    osMutexRelease(framMutexHandle);
+    return;
+
+spi_error:
+    HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+    log_message("SPI error while updating FRAM\r\n");
+    osMutexRelease(framMutexHandle);
+    return;
+}
+
 
 void updateTopRMS(float table[10][3],float rms_x, float rms_y, float rms_z){
 	float sqrtXYZ [3] = {rms_x,rms_y,rms_z};
@@ -1096,16 +1423,17 @@ void updateTopRMS(float table[10][3],float rms_x, float rms_y, float rms_z){
 			table[minIndex][j] = sqrtXYZ[j];
 		}
 	}
-//	log_message("======= TOP 10 LOCAL RMS VALUES =======");
-//	for (int i = 0; i < 10; i++)
-//	{
-//		log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
-//					i,
-//					topLocalRMS[i][0],
-//					topLocalRMS[i][1],
-//					topLocalRMS[i][2]);
-//	}
-//	log_message("========================================");
+
+	log_message("======= TOP 10 LOCAL RMS VALUES =======");
+	for (int i = 0; i < 10; i++)
+	{
+		log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
+					i,
+					topLocalRMS[i][0],
+					topLocalRMS[i][1],
+					topLocalRMS[i][2]);
+	}
+	log_message("========================================");
 }
 
 
@@ -1129,7 +1457,7 @@ void computeRMS(){
 
 void log_message(const char *format, ...)
 {
-    Message_t *msg = osMailAlloc(logMailQId, 0);
+    Message_t *msg = osMailAlloc(logMailQId, 0); // 0 no wait time (non blocking)
     if (!msg) return;
 
     va_list ap;
@@ -1234,6 +1562,7 @@ void LogMessageTask(void const * argument)
 void StartAcquisitionTask(void const * argument)
 {
 	static bool heapSizeChecked = false;
+	//restoringDataFromFRAMForAliveNode(node_id);
 
     for(;;) {
     	float sumADC_x = 0.0f, sumADC_y = 0.0f, sumADC_z = 0.0f;
@@ -1293,14 +1622,130 @@ void StartDetectionTask(void const * argument){
 /* --- RTC Time Synchronization --- */
 void StartSyncRTCFromNTPTask(void const * argument)
 {
-    for(;;) {
-    	osDelay(1);
+    static struct udp_pcb *pcb = NULL;
+    err_t err;
+    err_t err_dns;
+
+    uint8_t ntp_packet[48];
+
+    while (!netif_is_up(&gnetif)) {
+        osDelay(100);
     }
+
+    dns_done = 0;
+    dns_result = ERR_VAL;
+    ip_addr_set_zero(&ntp_ip);
+
+    err_dns = dns_gethostbyname_addrtype("be.pool.ntp.org",
+                                        &ntp_ip,
+                                        dns_cb,
+                                        NULL,
+                                        LWIP_DNS_ADDRTYPE_IPV4);
+
+    if (err_dns == ERR_OK) {
+        log_message("NTP DNS resolved : %s", ipaddr_ntoa(&ntp_ip));
+    }
+    else if (err_dns == ERR_INPROGRESS) {
+        log_message("NTP DNS resolving (async)");
+
+        uint32_t timeout_ms = 5000;
+        while (!dns_done && timeout_ms > 0) {
+            osDelay(50);
+            timeout_ms -= 50;
+        }
+
+        if (!dns_done || dns_result != ERR_OK || ip_addr_isany(&ntp_ip)) {
+            log_message("NTP DNS failed/timeout (res=%d)", (int)dns_result);
+            vTaskDelete(NULL);
+        }
+
+        log_message("NTP DNS resolved: %s", ipaddr_ntoa(&ntp_ip));
+    }
+    else {
+        log_message("NTP DNS start failed: %d", (int)err_dns);
+        vTaskDelete(NULL);
+    }
+
+    pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+    if (!pcb) {
+        log_message("NTP: udp_new failed");
+        vTaskDelete(NULL);
+    }
+
+    err = udp_bind(pcb, IP_ADDR_ANY, 0);
+    if (err != ERR_OK) {
+        log_message("NTP: udp_bind failed: %d", (int)err);
+        udp_remove(pcb);
+        vTaskDelete(NULL);
+    }
+
+    udp_recv(pcb, ntp_recv_cb, NULL);
+    log_message("UDP NTP socket ready");
+
+    memset(ntp_packet, 0, sizeof(ntp_packet));
+    ntp_packet[0] = 0x23; // LI=0, VN=4, Mode=3 (client)
+
+    struct pbuf *pb = pbuf_alloc(PBUF_TRANSPORT, sizeof(ntp_packet), PBUF_RAM);
+    if (!pb) {
+        log_message("NTP: pbuf_alloc failed");
+        udp_remove(pcb);
+        vTaskDelete(NULL);
+    }
+
+    memcpy(pb->payload, ntp_packet, sizeof(ntp_packet));
+
+    err = udp_sendto(pcb, pb, &ntp_ip, NTP_PORT);
+    pbuf_free(pb);
+
+    if (err != ERR_OK) {
+        log_message("NTP: udp_sendto failed: %d", (int)err);
+        udp_remove(pcb);
+        vTaskDelete(NULL);
+    }
+
+    log_message("NTP request sent");
+    vTaskDelete(NULL);
 }
+
 
 void StartReadTimeFromBQ32000Task(void const * argument)
 {
-    for(;;) { osDelay(1); }
+	 uint8_t rtcWriteData[3];
+	 uint8_t rtcReadData[3];
+
+	while(ntp_time_ok != 1){
+		osDelay(50);
+	}
+
+	rtcWriteData[0] = Dec_To_BCD(sec)  & 0x7F; // seconds
+	rtcWriteData[1] = Dec_To_BCD(min)  & 0x7F; // minutes
+	rtcWriteData[2] = Dec_To_BCD(hour) & 0x3F; // hours
+
+	HAL_StatusTypeDef st;
+
+	st = HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x00,
+	                       I2C_MEMADD_SIZE_8BIT,
+	                       rtcWriteData, 3, 100);
+
+	if (st != HAL_OK) {
+	    log_message("RTC write failed: %d\r\n", (int)st);
+	}
+    for(;;) {
+
+    	if (HAL_I2C_Mem_Read(&hi2c1, 0x68 << 1, 0x00,I2C_MEMADD_SIZE_8BIT,rtcReadData, 3, 100) == HAL_OK)
+		{
+			uint8_t seconds = BCD_To_Dec(rtcReadData[0] & 0x7F);
+			uint8_t minutes = BCD_To_Dec(rtcReadData[1] & 0x7F);
+			uint8_t hours   = BCD_To_Dec(rtcReadData[2] & 0x3F);
+
+			log_message("Time: %02u:%02u:%02u\r\n", hours, minutes, seconds);
+		}
+		else
+		{
+			log_message("RTC read failed\r\n");
+		}
+    	osDelay(1000);
+    }
 }
 
 
@@ -1310,6 +1755,10 @@ void StartTCPClientDataSyncTask(void const * argument)
 	for (;;)
 	{
 		log_message("\n\n ==============> SYNC DATA ROUTINE <============= \r\n");
+		/*
+		 * First updates my local topRMS to FRAM
+		 */
+		updateTableToFRAM(node_id);
 		log_message("Known nodes: %d", node_count);
 		// TCP client request every 60s data from all known nodes, fetch data_response and detection check + store RMS if > current top 10
 		for(int i=0;i<node_count;i++){
@@ -1522,11 +1971,31 @@ void StartDefaultTask(void const * argument)
       gnetif.hwaddr[0], gnetif.hwaddr[1], gnetif.hwaddr[2],
       gnetif.hwaddr[3], gnetif.hwaddr[4], gnetif.hwaddr[5]);
 
+  ip_addr_t dns;
+  ipaddr_aton("192.168.1.1", &dns);
+  dns_setserver(0, &dns);
+
+  const ip_addr_t* s0 = dns_getserver(0);
+  log_message("DNS (Gateway ip) = %s\n", ipaddr_ntoa(s0));
+
 
   char buf2[64];
   snprintf(buf2, sizeof(buf2), "Free heap after MX_LWIP_Init: %u bytes",
            (unsigned)xPortGetFreeHeapSize());
   log_message("%s", buf2);
+
+  log_message("Initializing my node as NodeInfo struct and storing in nodes array \r\n");
+  NodeInfo new_node;
+
+  ipaddr_aton(ip_buf, &new_node.ip); // Convert str to ipaddress
+  strncpy(new_node.id, node_id, sizeof(new_node.id));
+
+  nodes[node_count] = new_node;   // nodes[0]
+  node_count++;
+  log_message("Node count is %d",node_count);
+  print_all_nodes();
+//  osDelay(50);
+  restoringDataFromFRAMForAliveNode(node_id);
 
   /* Main loop */
   for(;;) {
