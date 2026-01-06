@@ -81,7 +81,7 @@ osThreadId defaultTaskHandle;
 #define NTP_PACKET_SIZE 48
 #define MAX_NODES 10
 #define FRAM_NODE_TABLE_BASE   0x000000u
-#define FRAM_SLOT_SIZE         256u
+#define FRAM_SLOT_SIZE         256u  // nucleoID + topRMS + timestamp
 #define NODE_ID_SIZE 20
 #define NODE_PREFIX "nucleo"
 #define NODE_PREFIX_LEN (sizeof(NODE_PREFIX) - 1)
@@ -128,6 +128,8 @@ volatile uint16_t year;
 volatile uint8_t  month, day;
 volatile uint8_t  hour, min, sec;
 volatile uint8_t ntp_time_ok = 0;
+volatile uint32_t g_unix_time = 0;
+
 
 /* UART debug structure */
 typedef struct {
@@ -260,6 +262,7 @@ static void ntp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     } else {
         uint32_t unix_time = ntp_seconds - NTP_TO_UNIX;
         log_message("NTP unix time: %lu", (unsigned long)unix_time);
+        g_unix_time = unix_time;
         uint32_t belgium_time = unix_time + 3600; // winter + 3600
         sec  = belgium_time % 60;
         belgium_time /= 60;
@@ -445,7 +448,7 @@ void handle_data_request(struct tcp_pcb *pcb)
                                 "\"y\":%.4f,"
                                 "\"z\":%.4f"
                               "},"
-                              "\"Status\":\"%s\""
+                              "\"status\":\"%s\""
                             "}",
                             type, node_id, timestamp,
 							sqrtX, sqrtY, sqrtZ,
@@ -551,6 +554,8 @@ void handle_data_response(const char *json){
 			updateTableToFRAM(nucleoID); // Update current node local data to FRAM
 			if(strcmp(status,"alert")==0){
 				nodeAlertCount++;
+				if(strcmp(currentStatus,"alert") == 0)triggerAlarm=true;
+				else triggerAlarm=false;
 			}
 			break;
 		}
@@ -574,7 +579,9 @@ void handle_data_response(const char *json){
 }
 
 void handle_alert(const char *json){
-
+	log_message("=== ALERT RECEIVEDDDD ===\r\n");
+	if(strcmp(currentStatus,"alert") == 0)triggerAlarm=true;
+	else triggerAlarm=false;
 }
 
 const char* determineADCDataStatus(float x, float y, float z)
@@ -586,7 +593,7 @@ const char* determineADCDataStatus(float x, float y, float z)
 	sumRMS_current = (x + y + z)/3;
 
 
-	log_message("========> Sum computed : %.4f",sumRMS_current);
+//	log_message("========> Sum computed : %.4f",sumRMS_current);
 
 	if(sumRMS_current < warning_sumRMS){
 		return "normal";
@@ -1205,7 +1212,7 @@ static uint8_t Dec_To_BCD(uint8_t dec)
  ========= Total Size per slot calculation
  * NodeID [20] = 20 bytes
  * float topRMS [10][3] = 30*4 = 120 bytes
- * CRC32 = 4 bytes
+ * timestamp = 4 bytes
  * Total per slot ID: 144 bytes => round to 2^8 => 256 bytes per slot
  */
 void restoringDataFromFRAMForAliveNode(const char *nodeID)
@@ -1215,6 +1222,8 @@ void restoringDataFromFRAMForAliveNode(const char *nodeID)
     char fetched_nodeID[NODE_ID_SIZE + 1];
     float topRMS[10][3];
     HAL_StatusTypeDef status;
+    uint32_t timestamp = 0;
+
 
     log_message("============= > Restoring data for %s", nodeID);
 
@@ -1236,6 +1245,7 @@ void restoringDataFromFRAMForAliveNode(const char *nodeID)
         HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
 
         fetched_nodeID[NODE_ID_SIZE] = '\0';
+        log_message("FRAM slot %d nodeID = '%s'", slot, fetched_nodeID);
 
         if (strncmp(fetched_nodeID, nodeID, NODE_ID_SIZE) == 0) {
 
@@ -1251,7 +1261,22 @@ void restoringDataFromFRAMForAliveNode(const char *nodeID)
             if (status != HAL_OK) goto spi_error;
             status = HAL_SPI_Receive(&hspi2, (uint8_t*)topRMS, sizeof(topRMS), HAL_MAX_DELAY);
             if (status != HAL_OK) goto spi_error;
+            status = HAL_SPI_Receive(&hspi2, (uint8_t*)&timestamp, sizeof(timestamp), HAL_MAX_DELAY);
+            if (status != HAL_OK) goto spi_error;
             HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
+
+            log_message("======= RESTORED RMS VALUES =======");
+            for (int i = 0; i < 3; i++)
+            {
+                log_message("#%02d: X=%d  Y=%d  Z=%d",
+                            i,
+                            (int)(topRMS[i][0] * 1000.0f),
+                            (int)(topRMS[i][1] * 1000.0f),
+                            (int)(topRMS[i][2] * 1000.0f));
+            }
+            log_message("=======================================");
+
+            log_message("timestamp=%lu", (unsigned long)timestamp);
 
             if (strncmp(nodeID, node_id, NODE_ID_SIZE) == 0) {
                 memcpy(topLocalRMS, topRMS, sizeof(topRMS));
@@ -1294,6 +1319,10 @@ void updateTableToFRAM(const char *nodeID){
     bool slotFound = false;
     uint32_t empty_addr = 0;
     float topRMS[10][3] = {0};
+    uint32_t timestamp = 0;
+
+	if(!ntp_time_ok) timestamp=0;
+	else timestamp = g_unix_time;
 
     if (strncmp(nodeID, node_id, NODE_ID_SIZE) == 0) {
         memcpy(topRMS, topLocalRMS, sizeof(topRMS));   // write local top10 directly
@@ -1361,6 +1390,8 @@ void updateTableToFRAM(const char *nodeID){
             if (status != HAL_OK) goto spi_error;
             status = HAL_SPI_Transmit(&hspi2, (uint8_t*)topRMS, sizeof(topRMS), HAL_MAX_DELAY);
             if (status != HAL_OK) goto spi_error;
+            status = HAL_SPI_Transmit(&hspi2, (uint8_t*)&timestamp, sizeof(timestamp), HAL_MAX_DELAY);
+			if (status != HAL_OK) goto spi_error;
             HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
             osMutexRelease(framMutexHandle);
             return;
@@ -1391,6 +1422,8 @@ void updateTableToFRAM(const char *nodeID){
         if (status != HAL_OK) goto spi_error;
         status = HAL_SPI_Transmit(&hspi2, (uint8_t*)topRMS, sizeof(topRMS), HAL_MAX_DELAY);
         if (status != HAL_OK) goto spi_error;
+        status = HAL_SPI_Transmit(&hspi2, (uint8_t*)&timestamp, sizeof(timestamp), HAL_MAX_DELAY);
+		if (status != HAL_OK) goto spi_error;
         HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin, GPIO_PIN_SET);
         osMutexRelease(framMutexHandle);
         return;
@@ -1424,16 +1457,16 @@ void updateTopRMS(float table[10][3],float rms_x, float rms_y, float rms_z){
 		}
 	}
 
-	log_message("======= TOP 10 LOCAL RMS VALUES =======");
-	for (int i = 0; i < 10; i++)
-	{
-		log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
-					i,
-					topLocalRMS[i][0],
-					topLocalRMS[i][1],
-					topLocalRMS[i][2]);
-	}
-	log_message("========================================");
+//	log_message("======= TOP 10 LOCAL RMS VALUES =======");
+//	for (int i = 0; i < 10; i++)
+//	{
+//		log_message("#%02d:  X=%.4f   Y=%.4f   Z=%.4f",
+//					i,
+//					topLocalRMS[i][0],
+//					topLocalRMS[i][1],
+//					topLocalRMS[i][2]);
+//	}
+//	log_message("========================================");
 }
 
 
@@ -1486,10 +1519,8 @@ void StartMasterTask(void const * argument)
 				vTaskResume(acquisitionTaskHandle);
 				vTaskResume(DetectionTaskHandle);
 				vTaskResume(heartbeatTaskHandle);
-//				vTaskResume(presenceBroadcastTaskHandle);
-//				vTaskResume(listenDataRequestTaskHandle);
-//				vTaskResume(sendsDataMessageTaskHandle);
-//				vTaskResume(UDPClientDataSyncTaskHandle);
+				vTaskResume(presenceBroadcastTaskHandle);
+				vTaskResume(TCPClientDataSyncTaskHandle);
 				log_message("USER button pressed! Resuming Tasks");
 				log_message("[Tick=%lu", (unsigned long)HAL_GetTick());
 				running = true;
@@ -1498,10 +1529,8 @@ void StartMasterTask(void const * argument)
 				vTaskSuspend(acquisitionTaskHandle);
 				vTaskSuspend(DetectionTaskHandle);
     			vTaskSuspend(heartbeatTaskHandle);
-//				vTaskSuspend(presenceBroadcastTaskHandle);
-//				vTaskSuspend(listenDataRequestTaskHandle);
-//				vTaskSuspend(sendsDataMessageTaskHandle);
-//				vTaskSuspend(UDPClientDataSyncTaskHandle);
+    			vTaskSuspend(presenceBroadcastTaskHandle);
+    			vTaskSuspend(TCPClientDataSyncTaskHandle);
 				log_message("USER button pressed! Suspending Tasks");
 				log_message("Tick=%lu", (unsigned long)HAL_GetTick());
 				running = false;
@@ -1592,9 +1621,11 @@ void StartAcquisitionTask(void const * argument)
 			meanIndex++;
 			if(meanIndex==10){
 				meanIndex=0; // Reset after storing 10 mean vals
-				log_message("10 mean data samples acquired => computing RMS (1s window)\r\n");
+//				log_message("10 mean data samples acquired => computing RMS (1s window)\r\n");
 				computeRMS();
 				currentStatus = determineADCDataStatus(sqrtX,sqrtY,sqrtZ);
+//				if(strcmp(currentStatus,"alert") == 0)triggerAlarm=true;
+//				else triggerAlarm=false;
 				log_message("Current Status : %s \r\n",currentStatus);
 				prev_rmsX=sqrtX;
 				prev_rmsY=sqrtY;
@@ -1614,6 +1645,7 @@ void StartAcquisitionTask(void const * argument)
 void StartDetectionTask(void const * argument){
 	for(;;){
 		if(triggerAlarm)HAL_GPIO_TogglePin(GPIOB, AlarmLED_Pin);
+		else HAL_GPIO_WritePin(GPIOB, AlarmLED_Pin, GPIO_PIN_RESET);
 		osDelay(400);
 	}
 }
@@ -1761,7 +1793,7 @@ void StartTCPClientDataSyncTask(void const * argument)
 		updateTableToFRAM(node_id);
 		log_message("Known nodes: %d", node_count);
 		// TCP client request every 60s data from all known nodes, fetch data_response and detection check + store RMS if > current top 10
-		for(int i=0;i<node_count;i++){
+		for(int i=1;i<node_count;i++){
 			char ip_str[16];
 			struct tcp_pcb *server_pcb;
 
@@ -1785,7 +1817,7 @@ void StartTCPClientDataSyncTask(void const * argument)
 
 
 		}
-		osDelay(60000); // sync data with all nodes every 60s
+		osDelay(20000); // sync data with all nodes every 60s
 
 	}
 
@@ -1994,7 +2026,7 @@ void StartDefaultTask(void const * argument)
   node_count++;
   log_message("Node count is %d",node_count);
   print_all_nodes();
-//  osDelay(50);
+//  osDelay(50);l
   restoringDataFromFRAMForAliveNode(node_id);
 
   /* Main loop */
