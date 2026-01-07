@@ -436,7 +436,8 @@ void handle_data_request(struct tcp_pcb *pcb)
     char type[]  = "data_response";
     const char* status = determineADCDataStatus(sqrtX,sqrtY,sqrtZ);
 
-    snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
+    //snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
+    snprintf(timestamp, sizeof(timestamp),"%02u:%02u:%02u",hour, min, sec);
 
     int resp_len = snprintf(response, sizeof(response),
                             "{"
@@ -1856,7 +1857,9 @@ void StartPresenceBroadcastTask(void const *argument)
 		char timestamp[32];
 
 		ipaddr_ntoa_r(netif_ip4_addr(netif_default), ip_str, sizeof(ip_str));
-		snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
+		//snprintf(timestamp, sizeof(timestamp), "2000-00-0000:00:00Z");
+    snprintf(timestamp, sizeof(timestamp),"%02u:%02u:%02u",hour, min, sec);
+
 
         int len = snprintf(msg, sizeof(msg),
                            "{"
